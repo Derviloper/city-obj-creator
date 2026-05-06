@@ -342,10 +342,116 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
         }
     }
 
-    // ---- (5) Manifold check. ----
+    // ---- (5) Consistent orientation pass. ----
+    //
+    // The per-face "expected outward normal" heuristic above is local and gets
+    // walls at concave corners wrong (the building centroid sits on the inside
+    // of the corner, so `face_center − centroid` points the wrong way). That
+    // produces edges traversed in the *same* direction by both adjacent
+    // triangles — a winding inconsistency Blender flags as non-manifold even
+    // though edge-count is exactly 2.
+    //
+    // BFS over face adjacency: starting from any seed, every neighbour that
+    // shares an edge in the same direction gets flipped. After the walk each
+    // connected component is internally consistent. Then a single signed-volume
+    // check per component flips it if it ended up inward-facing.
+    orient_consistently(&mut tris, &merger.verts);
+
+    // ---- (6) Manifold check. ----
     check_manifold(building.id.as_str(), &tris, merger.len());
 
     (merger.verts, tris)
+}
+
+/// Make face winding consistent across the whole mesh, then orient each
+/// connected component outward (signed volume > 0).
+fn orient_consistently(tris: &mut [[u32; 3]], verts: &[DVec3]) {
+    use std::collections::VecDeque;
+
+    if tris.is_empty() {
+        return;
+    }
+
+    let n = tris.len();
+
+    // Map each undirected edge to the triangles that touch it.
+    let mut edge_to_tris: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (i, tri) in tris.iter().enumerate() {
+        for e in 0..3 {
+            let a = tri[e];
+            let b = tri[(e + 1) % 3];
+            let key = if a < b { (a, b) } else { (b, a) };
+            edge_to_tris.entry(key).or_default().push(i);
+        }
+    }
+
+    // BFS over face adjacency. For each pair of adjacent triangles sharing
+    // an edge, the shared edge must be traversed in opposite directions; if
+    // not, flip the neighbour and propagate.
+    let mut visited = vec![false; n];
+    let mut component_of = vec![usize::MAX; n];
+    let mut components: usize = 0;
+    let mut queue: VecDeque<usize> = VecDeque::new();
+
+    for seed in 0..n {
+        if visited[seed] {
+            continue;
+        }
+        visited[seed] = true;
+        component_of[seed] = components;
+        queue.push_back(seed);
+        while let Some(t) = queue.pop_front() {
+            let tri = tris[t];
+            for e in 0..3 {
+                let a = tri[e];
+                let b = tri[(e + 1) % 3];
+                let key = if a < b { (a, b) } else { (b, a) };
+                let Some(neighbours) = edge_to_tris.get(&key) else {
+                    continue;
+                };
+                for &nb in neighbours {
+                    if nb == t || visited[nb] {
+                        continue;
+                    }
+                    // Inspect the neighbour's traversal of the shared edge.
+                    let ntri = tris[nb];
+                    let mut same_direction = false;
+                    for ne in 0..3 {
+                        let na = ntri[ne];
+                        let nb_v = ntri[(ne + 1) % 3];
+                        if na == a && nb_v == b {
+                            same_direction = true;
+                            break;
+                        }
+                    }
+                    if same_direction {
+                        tris[nb] = [ntri[0], ntri[2], ntri[1]];
+                    }
+                    visited[nb] = true;
+                    component_of[nb] = components;
+                    queue.push_back(nb);
+                }
+            }
+        }
+        components += 1;
+    }
+
+    // Per-component signed-volume check: flip the whole component if it ends
+    // up inward-facing. Reference point is the origin — works because the
+    // formula sums signed tetrahedra and the constant offset cancels for a
+    // closed mesh.
+    let mut vol = vec![0.0_f64; components];
+    for (i, tri) in tris.iter().enumerate() {
+        let a = verts[tri[0] as usize];
+        let b = verts[tri[1] as usize];
+        let c = verts[tri[2] as usize];
+        vol[component_of[i]] += a.dot(b.cross(c));
+    }
+    for (i, tri) in tris.iter_mut().enumerate() {
+        if vol[component_of[i]] < 0.0 {
+            *tri = [tri[0], tri[2], tri[1]];
+        }
+    }
 }
 
 /// Snap a vertex to a fixed grid for stable equality testing.
