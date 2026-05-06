@@ -269,9 +269,43 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
         }
     }
 
+    // ---- (1b) Split self-touching polygons.
+    //
+    // LVermGeo encodes some roof surfaces as a single ring that revisits the
+    // same vertex twice — used to lasso around a tiny pillar/turret. Fan-
+    // triangulating such a ring produces overlapping triangles and over-shared
+    // edges. We split each self-touching ring into an outer ring (with the
+    // detour removed) and the detour itself as its own closed loop. Each piece
+    // is recursively re-checked because it may still self-touch.
+    split_self_touching_polygons(&mut polygons, BUILDING_TOL);
+
+    // ---- (1c) Drop duplicate polygons.
+    //
+    // LVermGeo LoD2 data sometimes encodes the same quadrilateral as both a
+    // `WallSurface` and a `ClosureSurface`, or as two `ClosureSurface`s with
+    // opposite winding. Each duplicate emits its own triangulation, so every
+    // interior edge ends up shared by 4 triangles (over-shared, non-manifold).
+    // Two polygons are duplicates if their cyclic vertex sequences match — up
+    // to rotation and direction reversal — once snapped to the building grid.
+    dedup_polygons(&mut polygons, BUILDING_TOL);
+
     // ---- (2) T-junction fixing: ensure every vertex on a polygon edge is
     //          part of every other polygon that touches that edge. ----
     fix_t_junctions(&mut polygons, BUILDING_TOL);
+
+    // ---- (2b) Drop redundant polygons that create non-manifold edges.
+    //
+    // CityGML LoD2 from LVermGeo sometimes encodes the same wall as both a
+    // semantic `WallSurface` and a `ClosureSurface` (or as two closures), or
+    // packs three coplanar walls onto the same vertical edge at a tight corner.
+    // Each redundant polygon adds an extra triangulation to edges that are
+    // already covered, pushing edge count past 2 (over-shared, non-manifold).
+    //
+    // We iteratively remove the polygon whose deletion most improves the
+    // manifold metric (reduces over-shared edges without introducing new
+    // boundary ones). Closures are preferred over walls when tied because
+    // they're virtual closures rather than physical surfaces.
+    drop_redundant_polygons(&mut polygons, BUILDING_TOL);
 
     // ---- (3) Drop spurious internal horizontal "floors".
     //
@@ -462,6 +496,173 @@ fn snap_vec(v: DVec3, tol: f64) -> DVec3 {
         (v.y * inv).round() / inv,
         (v.z * inv).round() / inv,
     )
+}
+
+/// Greedy iterative pass: while any edge is shared by 3+ polygons, drop the
+/// single polygon whose removal most improves the manifold metric.
+///
+/// "Improvement" per edge of a candidate polygon:
+///   * count ≥ 3 → +1 (resolves an over-shared edge)
+///   * count == 1 → +1 (removes an orphan boundary edge)
+///   * count == 2 → -1 (would turn a clean edge into a boundary)
+///
+/// Closure surfaces get a +1 tiebreaker because they are CityGML's virtual
+/// closures and are the most likely to be redundant.
+fn drop_redundant_polygons(polygons: &mut Vec<(SurfaceType, Vec<DVec3>)>, tol: f64) {
+    use std::collections::HashMap;
+    let inv = 1.0 / tol;
+    let snap = |v: DVec3| -> (i64, i64, i64) {
+        (
+            (v.x * inv).round() as i64,
+            (v.y * inv).round() as i64,
+            (v.z * inv).round() as i64,
+        )
+    };
+
+    loop {
+        let mut edge_count: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
+        for (_, verts) in polygons.iter() {
+            let n = verts.len();
+            for i in 0..n {
+                let a = snap(verts[i]);
+                let b = snap(verts[(i + 1) % n]);
+                if a == b {
+                    continue;
+                }
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edge_count.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        let has_overshared = edge_count.values().any(|&c| c > 2);
+        if !has_overshared {
+            return;
+        }
+
+        let mut best: Option<(usize, i32)> = None;
+        for (idx, (surface_type, verts)) in polygons.iter().enumerate() {
+            let mut benefit: i32 = 0;
+            let n = verts.len();
+            let mut touches_overshared = false;
+            for i in 0..n {
+                let a = snap(verts[i]);
+                let b = snap(verts[(i + 1) % n]);
+                if a == b {
+                    continue;
+                }
+                let key = if a < b { (a, b) } else { (b, a) };
+                let c = edge_count.get(&key).copied().unwrap_or(0);
+                match c {
+                    c if c >= 3 => {
+                        benefit += 1;
+                        touches_overshared = true;
+                    }
+                    2 => benefit -= 1,
+                    1 => benefit += 1,
+                    _ => {}
+                }
+            }
+            if !touches_overshared {
+                continue;
+            }
+            if matches!(surface_type, SurfaceType::Closure) {
+                benefit += 1;
+            }
+            if best.map_or(true, |(_, b)| benefit > b) {
+                best = Some((idx, benefit));
+            }
+        }
+
+        match best {
+            Some((idx, benefit)) if benefit > 0 => {
+                polygons.remove(idx);
+            }
+            _ => return,
+        }
+    }
+}
+
+/// Split rings that touch themselves into separate non-self-touching rings.
+///
+/// If a polygon's vertex list contains the same snapped point at indices `i`
+/// and `j` (i<j), the ring is two loops joined at that pinch point: the outer
+/// loop `verts[0..=i] + verts[j+1..]` and the inner loop `verts[i..j]`. We
+/// emit both and recurse — either piece may still self-touch.
+fn split_self_touching_polygons(polygons: &mut Vec<(SurfaceType, Vec<DVec3>)>, tol: f64) {
+    let inv = 1.0 / tol;
+    let key_of = |v: DVec3| -> (i64, i64, i64) {
+        (
+            (v.x * inv).round() as i64,
+            (v.y * inv).round() as i64,
+            (v.z * inv).round() as i64,
+        )
+    };
+
+    let mut output: Vec<(SurfaceType, Vec<DVec3>)> = Vec::new();
+    let mut work: Vec<(SurfaceType, Vec<DVec3>)> = std::mem::take(polygons);
+
+    while let Some((surface_type, verts)) = work.pop() {
+        if verts.len() < 3 {
+            continue;
+        }
+        let keys: Vec<(i64, i64, i64)> = verts.iter().map(|v| key_of(*v)).collect();
+        let n = keys.len();
+        let mut found: Option<(usize, usize)> = None;
+        'outer: for i in 0..n {
+            for j in (i + 1)..n {
+                if keys[i] == keys[j] {
+                    found = Some((i, j));
+                    break 'outer;
+                }
+            }
+        }
+        match found {
+            None => output.push((surface_type, verts)),
+            Some((i, j)) => {
+                let mut outer_ring: Vec<DVec3> = verts[0..=i].to_vec();
+                outer_ring.extend_from_slice(&verts[j + 1..]);
+                let inner_ring: Vec<DVec3> = verts[i..j].to_vec();
+                if outer_ring.len() >= 3 {
+                    work.push((surface_type, outer_ring));
+                }
+                if inner_ring.len() >= 3 {
+                    work.push((surface_type, inner_ring));
+                }
+            }
+        }
+    }
+    *polygons = output;
+}
+
+/// Remove duplicate polygons from the list. A duplicate is any polygon whose
+/// snapped vertex cycle equals another polygon's cycle under either rotation
+/// or reversal. The first occurrence wins; subsequent copies are dropped.
+fn dedup_polygons(polygons: &mut Vec<(SurfaceType, Vec<DVec3>)>, tol: f64) {
+    use std::collections::HashSet;
+    let inv = 1.0 / tol;
+    let key_of = |v: DVec3| -> (i64, i64, i64) {
+        (
+            (v.x * inv).round() as i64,
+            (v.y * inv).round() as i64,
+            (v.z * inv).round() as i64,
+        )
+    };
+    let canon = |verts: &[DVec3]| -> Vec<(i64, i64, i64)> {
+        let keys: Vec<(i64, i64, i64)> = verts.iter().map(|v| key_of(*v)).collect();
+        let n = keys.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let start = (0..n).min_by_key(|&i| keys[i]).unwrap();
+        let forward: Vec<_> = (0..n).map(|i| keys[(start + i) % n]).collect();
+        let reverse: Vec<_> = (0..n).map(|i| keys[(start + n - i) % n]).collect();
+        if forward < reverse { forward } else { reverse }
+    };
+    let mut seen: HashSet<Vec<(i64, i64, i64)>> = HashSet::new();
+    polygons.retain(|(_, verts)| {
+        let c = canon(verts);
+        !c.is_empty() && seen.insert(c)
+    });
 }
 
 /// Insert intermediate vertices into polygon edges so that T-junctions become
