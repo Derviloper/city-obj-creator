@@ -7,7 +7,7 @@ use crate::model::{
     terrain::{GlobalTerrain, TerrainTile},
 };
 use super::{
-    normals::{fan_triangulate, polygon_normal},
+    normals::{ear_clip_triangulate, polygon_normal},
     vertex_merge::VertexMerger,
 };
 
@@ -332,18 +332,20 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
         }
     });
 
-    // ---- (4) Synthesize a ground polygon at min_z if nothing closes the bottom. ----
-    let has_floor_at_min_z = polygons.iter().any(|(_, verts)| {
-        verts.iter().all(|v| (v.z - min_z).abs() < 0.05)
-    });
-
-    if !has_floor_at_min_z && min_z.is_finite() {
-        if let Some(ground_verts) = synthesize_ground_from_polygons(&polygons, min_z) {
-            polygons.push((SurfaceType::Ground, ground_verts));
-            // Re-run T-junction fixer with the new ground polygon included.
-            fix_t_junctions(&mut polygons, BUILDING_TOL);
-        }
-    }
+    // ---- (4) Close any open boundary loops with cap polygons.
+    //
+    // Some LVermGeo buildings (notably bridges) ship without a polygon for the
+    // underside, leaving a hole bordered by a closed loop of unmatched polygon
+    // edges. Detect every such loop in the directed-edge graph, ear-clip-
+    // triangulate it in its best-fit plane, and emit the resulting triangles
+    // as cap polygons.
+    let _ = min_z; // kept for clarity; min_z used by earlier filter step.
+    close_open_boundary_loops(&mut polygons, BUILDING_TOL);
+    // No second T-junction pass: the cap is built from the same vertices that
+    // already exist on the wall side, so cap edges and wall edges already
+    // share endpoints. Re-running fix_t_junctions here would *re-insert* a
+    // collinear cap-perimeter vertex into another cap triangle's internal
+    // diagonal, creating duplicate degenerate triangles.
 
     // ---- (4) Build the actual mesh: vertex-merge + fan-triangulate + winding. ----
     let mut merger = VertexMerger::new();
@@ -360,7 +362,23 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
         let normal = polygon_normal(verts);
         let expected_outward = expected_normal_direction(*surface_type, centroid, verts);
 
-        let raw_tris = fan_triangulate(&indices);
+        // Ear-clipping (rather than naive fan-triangulation) picks each diagonal
+        // based on local convexity, so two unrelated polygons that happen to
+        // share two non-adjacent vertices won't both produce the same internal
+        // diagonal — which would otherwise cause that edge to be shared by
+        // 4 triangles (non-manifold). If ear-clipping stalls on a degenerate
+        // polygon, fall back to a fan from vertex 0.
+        let raw_tri_idx = ear_clip_triangulate(verts);
+        let raw_tris: Vec<[u32; 3]> = if raw_tri_idx.is_empty() && verts.len() >= 3 {
+            (1..verts.len() - 1)
+                .map(|i| [indices[0], indices[i], indices[i + 1]])
+                .collect()
+        } else {
+            raw_tri_idx
+                .into_iter()
+                .map(|t| [indices[t[0]], indices[t[1]], indices[t[2]]])
+                .collect()
+        };
         let flip = normal.dot(expected_outward) < 0.0;
 
         for tri in raw_tris {
@@ -391,10 +409,133 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
     // check per component flips it if it ended up inward-facing.
     orient_consistently(&mut tris, &merger.verts);
 
-    // ---- (6) Manifold check. ----
+    // ---- (7) Manifold check. ----
     check_manifold(building.id.as_str(), &tris, merger.len());
 
     (merger.verts, tris)
+}
+
+/// Detect every closed loop of unmatched directed polygon edges and append a
+/// cap polygon for each one. Each cap is a fan from a centroid vertex shared
+/// by every triangle of that cap, so the cap itself is internally manifold
+/// (every fan edge appears in exactly two cap triangles), and the perimeter
+/// edges go in the reverse direction of the walked boundary so they share
+/// each unmatched edge in opposite direction → manifold against the rest of
+/// the building.
+///
+/// Operates on the polygon list before triangulation so the new cap participates
+/// in the subsequent T-junction fixing and orient-consistency passes.
+fn close_open_boundary_loops(polygons: &mut Vec<(SurfaceType, Vec<DVec3>)>, tol: f64) {
+    use std::collections::{HashMap, HashSet};
+
+    let inv = 1.0 / tol;
+    let key_of = |v: DVec3| -> (i64, i64, i64) {
+        (
+            (v.x * inv).round() as i64,
+            (v.y * inv).round() as i64,
+            (v.z * inv).round() as i64,
+        )
+    };
+
+    // Tally directed edge counts across all polygons.
+    let mut directed: HashMap<((i64, i64, i64), (i64, i64, i64)), i32> = HashMap::new();
+    let mut coord: HashMap<(i64, i64, i64), DVec3> = HashMap::new();
+    for (_, verts) in polygons.iter() {
+        let n = verts.len();
+        for i in 0..n {
+            let a = verts[i];
+            let b = verts[(i + 1) % n];
+            let ka = key_of(a);
+            let kb = key_of(b);
+            if ka == kb {
+                continue;
+            }
+            coord.entry(ka).or_insert(a);
+            coord.entry(kb).or_insert(b);
+            *directed.entry((ka, kb)).or_insert(0) += 1;
+        }
+    }
+
+    // Unmatched directed edges (forward count > reverse count) are the boundary.
+    // Sort everything so the walk order — and therefore the resulting cap shape
+    // — is deterministic regardless of HashMap iteration order.
+    let mut directed_keys: Vec<((i64, i64, i64), (i64, i64, i64))> =
+        directed.keys().copied().collect();
+    directed_keys.sort();
+    let mut next_map: HashMap<(i64, i64, i64), Vec<(i64, i64, i64)>> = HashMap::new();
+    let mut unmatched: Vec<((i64, i64, i64), (i64, i64, i64))> = Vec::new();
+    for &(a, b) in &directed_keys {
+        let count = directed[&(a, b)];
+        let reverse = directed.get(&(b, a)).copied().unwrap_or(0);
+        let extra = count - reverse;
+        for _ in 0..extra.max(0) {
+            unmatched.push((a, b));
+            next_map.entry(a).or_default().push(b);
+        }
+    }
+    for nexts in next_map.values_mut() {
+        nexts.sort();
+    }
+    if unmatched.is_empty() {
+        return;
+    }
+
+    let mut used: HashSet<((i64, i64, i64), (i64, i64, i64))> = HashSet::new();
+    for &(start_a, start_b) in &unmatched {
+        if used.contains(&(start_a, start_b)) {
+            continue;
+        }
+        used.insert((start_a, start_b));
+        let mut loop_keys: Vec<(i64, i64, i64)> = vec![start_a];
+        let mut current = start_b;
+        let mut closed = false;
+        // Bound the walk so a corrupt graph can't loop forever.
+        for _ in 0..unmatched.len() + 1 {
+            if current == start_a {
+                closed = true;
+                break;
+            }
+            loop_keys.push(current);
+            let Some(nexts) = next_map.get(&current) else {
+                break;
+            };
+            let Some(&n) = nexts.iter().find(|&&n| !used.contains(&(current, n))) else {
+                break;
+            };
+            used.insert((current, n));
+            current = n;
+        }
+        if !closed || loop_keys.len() < 3 {
+            continue;
+        }
+
+        // Reverse the walked direction so the cap's perimeter edges are b→a,
+        // cancelling the boundary edges a→b.
+        loop_keys.reverse();
+        let cap: Vec<DVec3> = loop_keys
+            .iter()
+            .map(|k| *coord.get(k).expect("loop key seen during walk"))
+            .collect();
+
+        // Ear-clip in the cap's best-fit plane so triangles follow the hole's
+        // contour. A naive corner-fan would span the entire opening and emit
+        // huge slivers across long, non-convex holes such as a bridge
+        // underside. Each triangle is pushed as its own 3-vertex polygon — the
+        // standard fan_triangulate step handles 3-vertex polygons trivially.
+        let cap_tris = ear_clip_triangulate(&cap);
+        if cap_tris.is_empty() {
+            // Triangulation failed (degenerate loop); fall back to whole-loop
+            // polygon — fan_triangulate will at least keep things manifold.
+            polygons.push((SurfaceType::Closure, cap));
+        } else {
+            for tri in cap_tris {
+                polygons.push((
+                    SurfaceType::Closure,
+                    vec![cap[tri[0]], cap[tri[1]], cap[tri[2]]],
+                ));
+            }
+        }
+    }
 }
 
 /// Make face winding consistent across the whole mesh, then orient each
@@ -717,6 +858,14 @@ fn fix_t_junctions(polygons: &mut [(SurfaceType, Vec<DVec3>)], tol: f64) {
 
     let tol_sq = tol * tol;
     for (_, verts) in polygons.iter_mut() {
+        // Snapshot the polygon's existing vertex keys so we never re-insert a
+        // vertex it already contains — that would happen for a degenerate
+        // collinear triangle (a, m, b) where m sits on edge a→b, and would
+        // turn the polygon into [a, m, b, m] whose fan-triangulation emits a
+        // duplicate of the degenerate triangle.
+        let own_keys: HashSet<(i64, i64, i64)> =
+            verts.iter().map(|v| key_of(*v, tol)).collect();
+
         let mut new_verts: Vec<DVec3> = Vec::with_capacity(verts.len() * 2);
         let n = verts.len();
         for i in 0..n {
@@ -727,6 +876,10 @@ fn fix_t_junctions(polygons: &mut [(SurfaceType, Vec<DVec3>)], tol: f64) {
             // Find every other unique vertex sitting on segment (a, b).
             let mut splits: Vec<(f64, DVec3)> = Vec::new();
             for v in &all_verts {
+                // Skip vertices that already appear elsewhere in this polygon.
+                if own_keys.contains(&key_of(*v, tol)) {
+                    continue;
+                }
                 // Skip vertices that ARE a or b.
                 if (*v - a).length_squared() < tol_sq {
                     continue;
@@ -772,10 +925,10 @@ fn expected_normal_direction(
 
 /// Stitch wall-bottom edges from the polygon list into a closed ground polygon.
 ///
-/// Algorithm: collect every horizontal edge whose two endpoints both sit at
-/// `min_z`, then walk the directed-edge graph until we return to the starting
-/// vertex. The result follows the actual building footprint (handles L-shapes,
-/// concave outlines, etc.) far better than a convex hull would.
+/// Superseded by `close_open_boundary_loops`, which handles arbitrary
+/// (including non-planar) boundary loops. Kept here as a simpler reference
+/// for the flat-bottom-only case.
+#[allow(dead_code)]
 fn synthesize_ground_from_polygons(
     polygons: &[(SurfaceType, Vec<DVec3>)],
     min_z: f64,
