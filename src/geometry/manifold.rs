@@ -311,26 +311,17 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
     //
     // Some LVermGeo CityGML files mark a BuildingPart's upper-level floor as
     // a `GroundSurface`. Including it produces an internal slab (faces shared
-    // by 3+ triangles, non-manifold). We only want exterior-skin polygons:
-    //   * Keep ground polygons at min_z (the real bottom).
-    //   * Drop any `GroundSurface` polygon whose vertices lie >1 m above min_z.
-    //   * Likewise, drop any flat horizontal polygon (any type) whose vertices
-    //     sit at the same Z, that Z isn't min_z, and there are walls extending
-    //     both above and below it.
-    let min_z = polygons
-        .iter()
-        .flat_map(|(_, p)| p.iter())
-        .map(|v| v.z)
-        .fold(f64::INFINITY, f64::min);
-
-    polygons.retain(|(t, verts)| {
-        if *t == SurfaceType::Ground {
-            // Keep only if at the actual ground.
-            verts.iter().all(|v| (v.z - min_z).abs() < 0.5)
-        } else {
-            true
-        }
-    });
+    // by 3+ triangles, non-manifold). But sloped/stepped buildings legitimately
+    // have ground polygons spanning a meter or more vertically (the foundation
+    // top follows the slope), so a flat z-threshold incorrectly drops real
+    // ground there and leaves a hole.
+    //
+    // Heuristic: a ground polygon A is an internal floor if there is *another*
+    // ground polygon B sitting below it in xy — i.e. A's xy centroid lies
+    // inside B's xy projection AND A is at least 1 m above B in Z. Sloped
+    // ground tiles never satisfy this (no two project onto the same xy area);
+    // genuine internal floors do.
+    drop_internal_ground_floors(&mut polygons);
 
     // ---- (4) Close any open boundary loops with cap polygons.
     //
@@ -339,7 +330,6 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
     // edges. Detect every such loop in the directed-edge graph, ear-clip-
     // triangulate it in its best-fit plane, and emit the resulting triangles
     // as cap polygons.
-    let _ = min_z; // kept for clarity; min_z used by earlier filter step.
     close_open_boundary_loops(&mut polygons, BUILDING_TOL);
     // No second T-junction pass: the cap is built from the same vertices that
     // already exist on the wall side, so cap edges and wall edges already
@@ -413,6 +403,76 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
     check_manifold(building.id.as_str(), &tris, merger.len());
 
     (merger.verts, tris)
+}
+
+/// Drop ground polygons that represent internal floors of multi-story
+/// buildings (where LVermGeo data sometimes mistags upper-floor slabs as
+/// `GroundSurface`).
+///
+/// A ground polygon A is treated as internal — and dropped — only when some
+/// other ground polygon B has A's xy centroid inside its 2D projection *and*
+/// A sits at least 1 m above B in Z. This avoids dropping legitimate sloped
+/// or stepped ground polygons whose Z varies but which never project onto
+/// each other in xy.
+fn drop_internal_ground_floors(polygons: &mut Vec<(SurfaceType, Vec<DVec3>)>) {
+    const Z_GAP: f64 = 1.0;
+
+    let grounds: Vec<(usize, DVec3, f64, f64)> = polygons
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, _))| *t == SurfaceType::Ground)
+        .map(|(i, (_, verts))| {
+            let centroid = verts.iter().copied().sum::<DVec3>() / verts.len() as f64;
+            let min_z = verts.iter().map(|v| v.z).fold(f64::INFINITY, f64::min);
+            let max_z = verts.iter().map(|v| v.z).fold(f64::NEG_INFINITY, f64::max);
+            (i, centroid, min_z, max_z)
+        })
+        .collect();
+
+    let mut drop = vec![false; polygons.len()];
+    for &(ai, ac, a_min_z, _) in &grounds {
+        for &(bi, _, _, b_max_z) in &grounds {
+            if ai == bi {
+                continue;
+            }
+            if a_min_z <= b_max_z + Z_GAP {
+                continue;
+            }
+            let (_, b_verts) = &polygons[bi];
+            if point_in_polygon_xy(ac, b_verts) {
+                drop[ai] = true;
+                break;
+            }
+        }
+    }
+
+    let mut idx = 0;
+    polygons.retain(|_| {
+        let keep = !drop[idx];
+        idx += 1;
+        keep
+    });
+}
+
+/// 2D point-in-polygon test using the ray-casting (even-odd) rule on xy.
+fn point_in_polygon_xy(p: DVec3, polygon: &[DVec3]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = polygon[i];
+        let pj = polygon[j];
+        let crosses = (pi.y > p.y) != (pj.y > p.y)
+            && p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x;
+        if crosses {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// Detect every closed loop of unmatched directed polygon edges and append a
