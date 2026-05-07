@@ -5,6 +5,8 @@ mod geometry;
 mod model;
 mod parsers;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use glam::DVec3;
@@ -61,14 +63,38 @@ fn main() -> Result<()> {
                 ))?;
                 writer.write_newline()?;
 
+                let build_pb = ProgressBar::new_spinner();
+                build_pb.set_style(
+                    ProgressStyle::with_template("[{elapsed_precise}] {spinner} {msg}")
+                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                );
+                build_pb.enable_steady_tick(Duration::from_millis(100));
+                build_pb.set_message(format!(
+                    "building terrain mesh ({}×{} cells)",
+                    grid.cols, grid.rows
+                ));
                 let (verts, faces) = build_manifold_global_terrain(&grid);
+                build_pb.finish_with_message(format!(
+                    "terrain mesh built: {} vertices, {} triangles",
+                    verts.len(),
+                    faces.len()
+                ));
+
                 if !verts.is_empty() {
                     writer.write_object("Terrain")?;
-                    let base = writer.write_vertices(&verts, origin)?;
-                    writer.write_faces(&faces, base)?;
+                    let base = write_vertices_chunked(&mut writer, &verts, origin, "writing terrain vertices")?;
+                    write_faces_chunked(&mut writer, &faces, base, "writing terrain faces")?;
                 }
 
+                let flush_pb = ProgressBar::new_spinner();
+                flush_pb.set_style(
+                    ProgressStyle::with_template("[{elapsed_precise}] {spinner} {msg}")
+                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                );
+                flush_pb.enable_steady_tick(Duration::from_millis(100));
+                flush_pb.set_message("flushing terrain.obj");
                 writer.flush()?;
+                flush_pb.finish_with_message("terrain.obj flushed");
                 println!(
                     "Terrain written to {} ({} vertices, {} triangles)",
                     terrain_path.display(),
@@ -166,6 +192,42 @@ fn progress_bar(len: u64, label: &str) -> ProgressBar {
         .unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
     pb
+}
+
+/// Write vertices to the OBJ writer in chunks so a progress bar can advance.
+/// Returns the base vertex index of the first chunk (suitable for face refs).
+fn write_vertices_chunked(
+    writer: &mut ObjWriter,
+    verts: &[DVec3],
+    origin: DVec3,
+    label: &str,
+) -> Result<u64> {
+    const CHUNK: usize = 100_000;
+    let pb = progress_bar(verts.len() as u64, label);
+    let mut first_base: Option<u64> = None;
+    for chunk in verts.chunks(CHUNK) {
+        let base = writer.write_vertices(chunk, origin)?;
+        first_base.get_or_insert(base);
+        pb.inc(chunk.len() as u64);
+    }
+    pb.finish_with_message("done");
+    Ok(first_base.unwrap_or(writer.vertex_count))
+}
+
+fn write_faces_chunked(
+    writer: &mut ObjWriter,
+    faces: &[[u32; 3]],
+    base: u64,
+    label: &str,
+) -> Result<()> {
+    const CHUNK: usize = 100_000;
+    let pb = progress_bar(faces.len() as u64, label);
+    for chunk in faces.chunks(CHUNK) {
+        writer.write_faces(chunk, base)?;
+        pb.inc(chunk.len() as u64);
+    }
+    pb.finish_with_message("done");
+    Ok(())
 }
 
 fn sanitize_id(id: &str) -> String {

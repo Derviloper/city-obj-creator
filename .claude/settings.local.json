@@ -3,7 +3,10 @@
     "allow": [
       "WebSearch",
       "Bash(cargo *)",
-      "Bash(./target/release/city-obj-creator *)"
+      "Bash(./target/release/city-obj-creator *)",
+      "Bash(awk *)",
+      "Bash(tee *)",
+      "Read(//tmp/**)"
     ]
   }
 }

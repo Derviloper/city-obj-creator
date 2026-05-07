@@ -248,6 +248,13 @@ pub fn build_manifold_terrain(tile: &TerrainTile) -> (Vec<DVec3>, Vec<[u32; 3]>)
 /// Vertex-snap tolerance used by the building merger and T-junction fixer (5 mm).
 const BUILDING_TOL: f64 = 0.005;
 
+/// Secondary cluster-merge tolerance used after the initial snap to collapse
+/// near-duplicate vertices that LVermGeo encodes as separate corners a few
+/// centimetres apart. Applied only when both xy and z deltas are small, so
+/// genuine wall corners (same xy, different z) are not collapsed.
+const BUILDING_CLUSTER_XY: f64 = 0.05;
+const BUILDING_CLUSTER_Z: f64 = 0.02;
+
 /// Convert a building's surfaces into a manifold mesh.
 /// Pipeline:
 ///  1. Snap vertices in every polygon to a shared 5 mm grid (collapses near-duplicates).
@@ -268,6 +275,17 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
             polygons.push((surface.surface_type, snapped));
         }
     }
+
+    // ---- (1a2) Cluster-merge near-duplicate vertices.
+    //
+    // After the 5 mm snap, LVermGeo data sometimes still leaves the "same"
+    // corner as two vertices a few centimetres apart in xy at essentially the
+    // same z (often 1–4 cm). Triangulating across the gap produces sliver
+    // triangles whose internal diagonals collide with neighbouring polygons'
+    // diagonals — over-shared edges. Collapse such clusters to a single point
+    // (the cluster centroid). The tight z window keeps real wall corners
+    // (same xy, very different z) untouched.
+    cluster_merge_close_vertices(&mut polygons, BUILDING_CLUSTER_XY, BUILDING_CLUSTER_Z);
 
     // ---- (1b) Split self-touching polygons.
     //
@@ -384,6 +402,15 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
         }
     }
 
+    // ---- (4b) Greedy manifold repair: drop triangles touching over-shared
+    // edges when doing so strictly improves the manifold metric (reduces
+    // over-sharing without adding boundary edges). Handles residual cases
+    // where one CityGML polygon's internal triangulation diagonal happens to
+    // coincide with the perimeter edge of another polygon (e.g., L-shaped
+    // composite walls overlapping simple walls), pushing the shared edge to
+    // count = 4 even though the polygon-level checks all passed.
+    repair_overshared_edges(&mut tris);
+
     // ---- (5) Consistent orientation pass. ----
     //
     // The per-face "expected outward normal" heuristic above is local and gets
@@ -403,6 +430,203 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
     check_manifold(building.id.as_str(), &tris, merger.len());
 
     (merger.verts, tris)
+}
+
+/// Greedy manifold repair: while any undirected edge is shared by >2
+/// triangles, drop the triangle whose removal most improves the metric.
+/// Each candidate triangle scores +1 per over-shared edge it touches, -1
+/// per currently-manifold (count=2) edge, and 0 per boundary edge. Prefer
+/// strictly positive trades; accept zero-score trades (one over-shared
+/// resolved at the cost of one new boundary) when nothing better exists,
+/// since converting an over-shared edge to a boundary turns a non-manifold
+/// solid into a non-manifold open mesh — same severity, but more amenable
+/// to downstream cap-closing. Capped iteration count keeps a corrupt graph
+/// from looping.
+fn repair_overshared_edges(tris: &mut Vec<[u32; 3]>) {
+    use std::collections::HashMap;
+
+    let cap = tris.len() * 4;
+    for _ in 0..cap {
+        let mut edge_count: HashMap<(u32, u32), usize> = HashMap::new();
+        for tri in tris.iter() {
+            for e in 0..3 {
+                let a = tri[e];
+                let b = tri[(e + 1) % 3];
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edge_count.entry(key).or_insert(0) += 1;
+            }
+        }
+        if !edge_count.values().any(|&c| c > 2) {
+            return;
+        }
+
+        let mut best: Option<(usize, i32)> = None;
+        for (i, tri) in tris.iter().enumerate() {
+            let mut touches_overshared = false;
+            let mut score: i32 = 0;
+            for e in 0..3 {
+                let a = tri[e];
+                let b = tri[(e + 1) % 3];
+                let key = if a < b { (a, b) } else { (b, a) };
+                let c = edge_count.get(&key).copied().unwrap_or(0);
+                match c {
+                    c if c >= 3 => {
+                        score += 1;
+                        touches_overshared = true;
+                    }
+                    2 => score -= 1,
+                    _ => {}
+                }
+            }
+            if !touches_overshared {
+                continue;
+            }
+            if best.map_or(true, |(_, b)| score > b) {
+                best = Some((i, score));
+            }
+        }
+
+        match best {
+            Some((idx, score)) if score >= 0 => {
+                tris.swap_remove(idx);
+            }
+            _ => return,
+        }
+    }
+}
+
+/// Merge clusters of near-duplicate vertices across all polygons.
+///
+/// Builds union-find groups over every distinct vertex: two vertices are
+/// joined when their xy distance is within `xy_tol` AND their z distance is
+/// within `z_tol`. Each group is then collapsed to its centroid in every
+/// polygon's vertex list. After collapsing, consecutive duplicates within a
+/// polygon (introduced by the merge) are removed.
+fn cluster_merge_close_vertices(
+    polygons: &mut [(SurfaceType, Vec<DVec3>)],
+    xy_tol: f64,
+    z_tol: f64,
+) {
+    use std::collections::HashMap;
+
+    // Collect distinct vertices via the snap grid we already used.
+    let inv = 1.0 / BUILDING_TOL;
+    let key_of = |v: DVec3| -> (i64, i64, i64) {
+        (
+            (v.x * inv).round() as i64,
+            (v.y * inv).round() as i64,
+            (v.z * inv).round() as i64,
+        )
+    };
+    let mut key_to_idx: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut verts: Vec<DVec3> = Vec::new();
+    for (_, vs) in polygons.iter() {
+        for v in vs {
+            let k = key_of(*v);
+            if !key_to_idx.contains_key(&k) {
+                key_to_idx.insert(k, verts.len());
+                verts.push(*v);
+            }
+        }
+    }
+    let n = verts.len();
+    if n < 2 {
+        return;
+    }
+
+    // Bucket by an xy_tol grid for O(n) average pair search.
+    let cell_xy = xy_tol;
+    let cell_of = |v: DVec3| -> (i64, i64) {
+        ((v.x / cell_xy).floor() as i64, (v.y / cell_xy).floor() as i64)
+    };
+    let mut buckets: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (i, v) in verts.iter().enumerate() {
+        buckets.entry(cell_of(*v)).or_default().push(i);
+    }
+
+    // Union-find.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut c = i;
+        while parent[c] != c {
+            let next = parent[c];
+            parent[c] = r;
+            c = next;
+        }
+        r
+    }
+    let xy_tol_sq = xy_tol * xy_tol;
+    for i in 0..n {
+        let vi = verts[i];
+        let (cx, cy) = cell_of(vi);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let Some(others) = buckets.get(&(cx + dx, cy + dy)) else {
+                    continue;
+                };
+                for &j in others {
+                    if j <= i {
+                        continue;
+                    }
+                    let vj = verts[j];
+                    let dxv = vi.x - vj.x;
+                    let dyv = vi.y - vj.y;
+                    let dzv = (vi.z - vj.z).abs();
+                    if dzv <= z_tol && dxv * dxv + dyv * dyv <= xy_tol_sq {
+                        let ri = find(&mut parent, i);
+                        let rj = find(&mut parent, j);
+                        if ri != rj {
+                            parent[ri] = rj;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Compute per-cluster centroids.
+    let mut sums: HashMap<usize, (DVec3, usize)> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        let entry = sums.entry(r).or_insert((DVec3::ZERO, 0));
+        entry.0 += verts[i];
+        entry.1 += 1;
+    }
+    let centroid_for = |i: usize, parent: &mut [usize]| -> DVec3 {
+        let r = find(parent, i);
+        let (s, c) = sums[&r];
+        s / c as f64
+    };
+
+    // Rewrite polygon vertex lists, collapsing consecutive duplicates.
+    for (_, vs) in polygons.iter_mut() {
+        let mapped: Vec<DVec3> = vs
+            .iter()
+            .map(|v| {
+                let i = *key_to_idx.get(&key_of(*v)).expect("vertex in index");
+                centroid_for(i, &mut parent)
+            })
+            .collect();
+        let mut deduped: Vec<DVec3> = Vec::with_capacity(mapped.len());
+        for v in mapped {
+            if deduped.last().map_or(true, |last: &DVec3| {
+                (*last - v).length_squared() > 1e-12
+            }) {
+                deduped.push(v);
+            }
+        }
+        // Drop closing duplicate if present.
+        if deduped.len() >= 2
+            && (deduped[0] - *deduped.last().unwrap()).length_squared() < 1e-12
+        {
+            deduped.pop();
+        }
+        *vs = deduped;
+    }
 }
 
 /// Drop ground polygons that represent internal floors of multi-story
