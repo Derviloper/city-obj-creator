@@ -8,21 +8,29 @@ use tiff::{
 
 use crate::{
     bbox::BBox,
-    model::terrain::{GlobalTerrain, TerrainTile},
+    model::terrain::GlobalTerrain,
 };
 
 // GDAL nodata tag
 const TAG_GDAL_NODATA: u16 = 42113;
 
-/// Read a single DGM1 GeoTIFF tile.
+/// Elevation grid for one DGM1 GeoTIFF tile, used internally to merge tiles
+/// into a `GlobalTerrain`. Geo-transform is read separately via
+/// `read_tile_meta`; this struct only carries pixels + dimensions.
+struct TerrainTile {
+    cols: usize,
+    rows: usize,
+    z: Vec<f64>,
+}
+
+/// Read pixel data from a single DGM1 GeoTIFF tile.
 /// The tile must be a single-band float raster in ETRS89/UTM32N (EPSG:25832).
-pub fn read_tile(path: &Path) -> Result<TerrainTile> {
+fn read_tile(path: &Path) -> Result<TerrainTile> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("opening DGM1 tile: {}", path.display()))?;
     let mut dec = Decoder::new(file)
         .context("creating TIFF decoder")?;
 
-    // Image dimensions
     let (cols, rows) = dec.dimensions()
         .context("reading TIFF dimensions")?;
     let cols = cols as usize;
@@ -38,22 +46,10 @@ pub fn read_tile(path: &Path) -> Result<TerrainTile> {
             _ => None,
         });
 
-    // --- Extract geo-transform using the named GeoTIFF tags ---
-    // Try ModelTransformationTag (affine 4×4) first, then ModelPixelScale + ModelTiepoint.
-    let (origin_x, origin_y, res) = extract_geo_transform(&mut dec, path)?;
-
-    // --- Read elevation data ---
     let raw = dec.read_image().context("reading TIFF image data")?;
     let z = raster_to_f64(raw, cols * rows, nodata);
 
-    Ok(TerrainTile {
-        origin_x,
-        origin_y,
-        res,
-        cols,
-        rows,
-        z,
-    })
+    Ok(TerrainTile { cols, rows, z })
 }
 
 fn extract_geo_transform(
@@ -61,16 +57,16 @@ fn extract_geo_transform(
     path: &Path,
 ) -> Result<(f64, f64, f64)> {
     // Prefer ModelTransformationTag (4×4 affine matrix, 16 f64 values).
-    if let Ok(Some(floats)) = dec.find_tag(Tag::ModelTransformationTag)
+    if let Ok(Some(floats)) = dec
+        .find_tag(Tag::ModelTransformationTag)
         .map(|r| r.map(tag_to_f64_vec))
+        && floats.len() >= 12
     {
-        if floats.len() >= 12 {
-            let tx = floats[3];
-            let ty = floats[7];
-            let sx = floats[0];
-            let sy = floats[5].abs();
-            return Ok((tx, ty, sx.max(sy)));
-        }
+        let tx = floats[3];
+        let ty = floats[7];
+        let sx = floats[0];
+        let sy = floats[5].abs();
+        return Ok((tx, ty, sx.max(sy)));
     }
 
     // Fallback: ModelPixelScaleTag + ModelTiepointTag

@@ -212,25 +212,23 @@ pub fn stream_buildings(
                 match ps.state {
                     State::Root => {}
                     State::InBuilding => {
-                        if is_bldg_ns(ns_bytes) {
-                            if let Some(st) = surface_type_from_local(local_bytes) {
-                                ps.state = State::InBoundedBy;
-                                ps.current_surface_type = st;
-                                ps.surface_depth = ps.depth;
-                            }
+                        if is_bldg_ns(ns_bytes)
+                            && let Some(st) = surface_type_from_local(local_bytes)
+                        {
+                            ps.state = State::InBoundedBy;
+                            ps.current_surface_type = st;
+                            ps.surface_depth = ps.depth;
                         }
                     }
                     State::InBoundedBy => {
-                        if is_bldg_ns(ns_bytes) {
-                            if let Some(st) = surface_type_from_local(local_bytes) {
-                                ps.current_surface_type = st;
-                            }
+                        if is_bldg_ns(ns_bytes)
+                            && let Some(st) = surface_type_from_local(local_bytes)
+                        {
+                            ps.current_surface_type = st;
                         }
                         if is_gml_ns(ns_bytes) && local_bytes == b"Polygon" {
                             ps.state = State::InPolygon;
                             ps.polygon_depth = ps.depth;
-
-                            // Check for xlink:href on the wrapping surfaceMember
                         }
                     }
                     State::InPolygon => {
@@ -276,10 +274,10 @@ pub fn stream_buildings(
                         if alocal.as_ref() == b"href" {
                             let href = String::from_utf8_lossy(&attr.value).into_owned();
                             let id = href.trim_start_matches('#').to_string();
-                            if let Some(verts) = ps.geom_pool.get(&id) {
-                                if verts.len() >= 3 {
-                                    ps.current_polygons.push(Polygon(verts.clone()));
-                                }
+                            if let Some(verts) = ps.geom_pool.get(&id)
+                                && verts.len() >= 3
+                            {
+                                ps.current_polygons.push(Polygon(verts.clone()));
                             }
                         }
                     }
@@ -343,33 +341,31 @@ pub fn stream_buildings(
                     }
                     State::InBuilding => {
                         // Close the innermost scope when we reach its element's End.
-                        if let Some(top_depth) = ps.scopes.last().map(|s| s.depth) {
-                            if ps.depth == top_depth
-                                && is_bldg_ns(ns_bytes)
-                                && (local_bytes == b"Building"
-                                    || local_bytes == b"BuildingPart")
-                            {
-                                if let Some(building) = ps.pop_scope() {
-                                    let in_bbox = bbox.map_or(true, |bb| {
-                                        building.bounds().map_or(false, |(bmin, bmax)| {
-                                            let tile_bb = BBox {
-                                                xmin: bmin.x,
-                                                ymin: bmin.y,
-                                                xmax: bmax.x,
-                                                ymax: bmax.y,
-                                            };
-                                            bb.intersects(&tile_bb)
-                                        })
-                                    });
-                                    if in_bbox && !building.surfaces.is_empty() {
-                                        visitor(building)?;
-                                    }
+                        if let Some(top_depth) = ps.scopes.last().map(|s| s.depth)
+                            && ps.depth == top_depth
+                            && is_bldg_ns(ns_bytes)
+                            && (local_bytes == b"Building" || local_bytes == b"BuildingPart")
+                        {
+                            if let Some(building) = ps.pop_scope() {
+                                let in_bbox = bbox.is_none_or(|bb| {
+                                    building.bounds().is_some_and(|(bmin, bmax)| {
+                                        let tile_bb = BBox {
+                                            xmin: bmin.x,
+                                            ymin: bmin.y,
+                                            xmax: bmax.x,
+                                            ymax: bmax.y,
+                                        };
+                                        bb.intersects(&tile_bb)
+                                    })
+                                });
+                                if in_bbox && !building.surfaces.is_empty() {
+                                    visitor(building)?;
                                 }
-                                // If outer scope still open, stay in InBuilding;
-                                // otherwise return to Root.
-                                if ps.scopes.is_empty() {
-                                    ps.state = State::Root;
-                                }
+                            }
+                            // If outer scope still open, stay in InBuilding;
+                            // otherwise return to Root.
+                            if ps.scopes.is_empty() {
+                                ps.state = State::Root;
                             }
                         }
                     }

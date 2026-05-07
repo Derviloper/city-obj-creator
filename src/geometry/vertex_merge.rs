@@ -29,9 +29,6 @@ impl VertexMerger {
         idx
     }
 
-    pub fn len(&self) -> usize {
-        self.verts.len()
-    }
 }
 
 /// Snap a vertex to 1mm grid for deduplication.
