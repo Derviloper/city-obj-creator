@@ -18,12 +18,4 @@ pub struct Cli {
     /// Output directory for .obj files (created if it doesn't exist)
     #[arg(long, short, default_value = "output")]
     pub output: PathBuf,
-
-    /// Bounding box filter: xmin,ymin,xmax,ymax in ETRS89/UTM32N (EPSG:25832)
-    #[arg(long)]
-    pub bbox: Option<String>,
-
-    /// Only output buildings whose gml:id matches one of these (debug aid).
-    #[arg(long)]
-    pub building_id: Vec<String>,
 }

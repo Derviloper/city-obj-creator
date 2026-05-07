@@ -13,10 +13,7 @@ use quick_xml::{
     NsReader,
 };
 
-use crate::{
-    bbox::BBox,
-    model::building::{Building, Polygon, Surface, SurfaceType},
-};
+use crate::model::building::{Building, Polygon, Surface, SurfaceType};
 
 // CityGML building namespace URIs (versions 1.0 and 2.0).
 const BLDG_NS_1: &[u8] = b"http://www.opengis.net/citygml/building/1.0";
@@ -163,7 +160,6 @@ impl ParserState {
 /// Only one building is held in memory at a time.
 pub fn stream_buildings(
     path: &Path,
-    bbox: Option<BBox>,
     mut visitor: impl FnMut(Building) -> Result<()>,
 ) -> Result<()> {
     let file = File::open(path)
@@ -346,21 +342,10 @@ pub fn stream_buildings(
                             && is_bldg_ns(ns_bytes)
                             && (local_bytes == b"Building" || local_bytes == b"BuildingPart")
                         {
-                            if let Some(building) = ps.pop_scope() {
-                                let in_bbox = bbox.is_none_or(|bb| {
-                                    building.bounds().is_some_and(|(bmin, bmax)| {
-                                        let tile_bb = BBox {
-                                            xmin: bmin.x,
-                                            ymin: bmin.y,
-                                            xmax: bmax.x,
-                                            ymax: bmax.y,
-                                        };
-                                        bb.intersects(&tile_bb)
-                                    })
-                                });
-                                if in_bbox && !building.surfaces.is_empty() {
-                                    visitor(building)?;
-                                }
+                            if let Some(building) = ps.pop_scope()
+                                && !building.surfaces.is_empty()
+                            {
+                                visitor(building)?;
                             }
                             // If outer scope still open, stay in InBuilding;
                             // otherwise return to Root.

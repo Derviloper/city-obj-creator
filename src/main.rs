@@ -1,4 +1,3 @@
-mod bbox;
 mod cli;
 mod export;
 mod geometry;
@@ -12,10 +11,9 @@ use clap::Parser;
 use glam::DVec3;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use bbox::parse_bbox;
 use cli::Cli;
 use export::obj::ObjWriter;
-use geometry::manifold::{build_manifold_building, build_manifold_global_terrain, dump_boundary_edges};
+use geometry::manifold::{build_manifold_building, build_manifold_global_terrain};
 use model::building::Building;
 use parsers::{
     citygml::{collect_gml_files, stream_buildings},
@@ -25,27 +23,20 @@ use parsers::{
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let bbox = cli
-        .bbox
-        .as_deref()
-        .map(parse_bbox)
-        .transpose()?;
-
     std::fs::create_dir_all(&cli.output)?;
 
     // A single global XY origin shared by both terrain and buildings.
     // All output coordinates are (utm_x - origin.x, utm_y - origin.y, utm_z).
     // This keeps values small for 3D viewer compatibility while preserving
-    // relative positions between all objects.
-    // Set from --bbox min corner if provided, otherwise from first data encountered.
-    let mut global_origin: Option<DVec3> = bbox.map(|bb| DVec3::new(bb.xmin, bb.ymin, 0.0));
+    // relative positions between all objects. Set from first data encountered.
+    let mut global_origin: Option<DVec3> = None;
 
     // ------------------------------------------------------------------
     // Terrain: merge all DGM1 tiles into one combined elevation grid,
     // build a single watertight mesh, write it out.
     // ------------------------------------------------------------------
     if let Some(dgm1_dir) = &cli.dgm1 {
-        match read_global_terrain(dgm1_dir, bbox)? {
+        match read_global_terrain(dgm1_dir)? {
             None => {
                 eprintln!("WARN: no DGM1 tiles loaded from {}", dgm1_dir.display());
             }
@@ -131,20 +122,10 @@ fn main() -> Result<()> {
                 .to_string(),
         );
 
-        let result = stream_buildings(path, bbox, |building: Building| {
-            if !cli.building_id.is_empty()
-                && !cli.building_id.iter().any(|id| id == &building.id)
-            {
-                return Ok(());
-            }
+        let result = stream_buildings(path, |building: Building| {
             let (verts, faces) = build_manifold_building(&building);
             if verts.is_empty() || faces.is_empty() {
                 return Ok(());
-            }
-
-            // When a single building is requested, dump every boundary edge for inspection.
-            if !cli.building_id.is_empty() {
-                dump_boundary_edges(&building.id, &verts, &faces);
             }
 
             // Lock global origin from the first building if terrain wasn't processed.

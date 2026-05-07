@@ -6,10 +6,7 @@ use tiff::{
     tags::Tag,
 };
 
-use crate::{
-    bbox::BBox,
-    model::terrain::GlobalTerrain,
-};
+use crate::model::terrain::GlobalTerrain;
 
 // GDAL nodata tag
 const TAG_GDAL_NODATA: u16 = 42113;
@@ -221,16 +218,13 @@ fn read_tile_meta(path: &Path) -> Result<TileMeta> {
 /// Adjacent tiles are stitched at their shared boundary pixels (no duplication, no seams).
 ///
 /// Memory cost: peak ≈ size of the combined grid (8 bytes per pixel) + one tile.
-pub fn read_global_terrain(
-    dir: &Path,
-    bbox: Option<BBox>,
-) -> Result<Option<GlobalTerrain>> {
+pub fn read_global_terrain(dir: &Path) -> Result<Option<GlobalTerrain>> {
     let tif_files = collect_tif_files(dir)?;
     if tif_files.is_empty() {
         return Ok(None);
     }
 
-    // Pass 1: read metadata of every tile, filter by bbox.
+    // Pass 1: read metadata of every tile.
     let mut metas: Vec<TileMeta> = Vec::new();
     for path in &tif_files {
         let m = match read_tile_meta(path) {
@@ -240,19 +234,6 @@ pub fn read_global_terrain(
                 continue;
             }
         };
-        if let Some(bb) = bbox {
-            let tile_xmax = m.origin_x + (m.cols as f64 - 1.0) * m.res;
-            let tile_ymin = m.origin_y - (m.rows as f64 - 1.0) * m.res;
-            let tile_bb = BBox {
-                xmin: m.origin_x - 0.5 * m.res,
-                ymin: tile_ymin - 0.5 * m.res,
-                xmax: tile_xmax + 0.5 * m.res,
-                ymax: m.origin_y + 0.5 * m.res,
-            };
-            if !bb.intersects(&tile_bb) {
-                continue;
-            }
-        }
         metas.push(m);
     }
 
