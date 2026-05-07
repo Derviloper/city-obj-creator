@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use glam::DVec3;
+use glam::{DVec2, DVec3};
 
 use crate::geometry::normals::ear_clip_triangulate;
 use crate::geometry::vertex_merge::VertexMerger;
@@ -14,6 +14,81 @@ const PLANE_EPS: f64 = 1e-6;
 enum Axis {
     X,
     Y,
+}
+
+/// Clip a 2D polygon to an axis-aligned bounding box using Sutherland-Hodgman.
+/// Walks the polygon against each of the four bbox half-planes in turn. The
+/// returned ring keeps the input's winding and has no closing duplicate; an
+/// empty result means the polygon is fully outside the bbox.
+pub fn clip_polygon_to_aabb_xy_2d(ring: &[DVec2], bbox: BBox2) -> Vec<DVec2> {
+    if ring.len() < 3 {
+        return Vec::new();
+    }
+    let mut out = ring.to_vec();
+    out = clip_to_edge(&out, |p| p.x >= bbox.xmin, |a, b| intersect_x(a, b, bbox.xmin));
+    out = clip_to_edge(&out, |p| p.x <= bbox.xmax, |a, b| intersect_x(a, b, bbox.xmax));
+    out = clip_to_edge(&out, |p| p.y >= bbox.ymin, |a, b| intersect_y(a, b, bbox.ymin));
+    out = clip_to_edge(&out, |p| p.y <= bbox.ymax, |a, b| intersect_y(a, b, bbox.ymax));
+    // Sutherland-Hodgman on a non-convex polygon can emit consecutive
+    // duplicate vertices where the boundary touches a clip edge tangentially.
+    // Drop them so downstream side-wall meshing stays manifold.
+    let eps2 = 1e-18;
+    let mut deduped: Vec<DVec2> = Vec::with_capacity(out.len());
+    for p in out {
+        if let Some(prev) = deduped.last()
+            && (*prev - p).length_squared() < eps2
+        {
+            continue;
+        }
+        deduped.push(p);
+    }
+    if deduped.len() >= 2 {
+        let first = deduped[0];
+        let last = *deduped.last().unwrap();
+        if (first - last).length_squared() < eps2 {
+            deduped.pop();
+        }
+    }
+    deduped
+}
+
+fn clip_to_edge(
+    poly: &[DVec2],
+    inside: impl Fn(DVec2) -> bool,
+    intersect: impl Fn(DVec2, DVec2) -> DVec2,
+) -> Vec<DVec2> {
+    let n = poly.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<DVec2> = Vec::with_capacity(n + 4);
+    for i in 0..n {
+        let a = poly[(i + n - 1) % n];
+        let b = poly[i];
+        let a_in = inside(a);
+        let b_in = inside(b);
+        if b_in {
+            if !a_in {
+                out.push(intersect(a, b));
+            }
+            out.push(b);
+        } else if a_in {
+            out.push(intersect(a, b));
+        }
+    }
+    out
+}
+
+fn intersect_x(a: DVec2, b: DVec2, x: f64) -> DVec2 {
+    let dx = b.x - a.x;
+    let t = if dx.abs() < f64::EPSILON { 0.0 } else { (x - a.x) / dx };
+    DVec2::new(x, a.y + t * (b.y - a.y))
+}
+
+fn intersect_y(a: DVec2, b: DVec2, y: f64) -> DVec2 {
+    let dy = b.y - a.y;
+    let t = if dy.abs() < f64::EPSILON { 0.0 } else { (y - a.y) / dy };
+    DVec2::new(a.x + t * (b.x - a.x), y)
 }
 
 /// Clip a closed manifold mesh to a tile's XY bounding box, patching the

@@ -9,16 +9,20 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use glam::DVec3;
+use glam::{DVec2, DVec3};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use cli::Cli;
 use export::obj::ObjWriter;
 use geometry::clip::clip_mesh_to_aabb_xy;
-use geometry::manifold::{build_manifold_building, build_manifold_global_terrain, check_manifold};
+use geometry::manifold::{
+    build_manifold_building, build_manifold_global_terrain, build_manifold_road, check_manifold,
+};
+use model::alkis::SurfaceFeature;
 use model::building::Building;
 use model::tile::{BBox2, Tile};
 use parsers::{
+    alkis::{collect_alkis_files, stream_alkis_features},
     citygml::{collect_gml_files, stream_buildings},
     dgm1::{list_tiles, read_tile_terrain},
 };
@@ -59,6 +63,14 @@ fn main() -> Result<()> {
     // tiles, write per-tile pieces.
     // ------------------------------------------------------------------
     write_per_tile_buildings(&tiles, &cli)?;
+
+    // ------------------------------------------------------------------
+    // Phase 3: roads (optional). Stream ALKIS, extrude over terrain,
+    // clip to tile bbox, write per-tile road.obj.
+    // ------------------------------------------------------------------
+    if cli.alkis.is_some() {
+        write_per_tile_roads(&tiles, &cli)?;
+    }
 
     println!("Done.");
     Ok(())
@@ -213,6 +225,146 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli) -> Result<()> {
         tile_building_counts.len()
     );
     Ok(())
+}
+
+fn write_per_tile_roads(tiles: &[Tile], cli: &Cli) -> Result<()> {
+    let alkis_dir = match cli.alkis.as_ref() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    let alkis_files = collect_alkis_files(alkis_dir)?;
+    if alkis_files.is_empty() {
+        eprintln!("WARN: no .xml files found in {}", alkis_dir.display());
+        return Ok(());
+    }
+
+    // Stage 1: stream once, fan out features into per-tile buckets.
+    // Storing 2D rings is cheap; one full terrain grid in memory at a time
+    // (Stage 2) is the real memory budget.
+    let mut per_tile: HashMap<String, Vec<SurfaceFeature>> = HashMap::new();
+    let pb = progress_bar(alkis_files.len() as u64, "ALKIS files");
+    for path in &alkis_files {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        pb.set_message(file_name);
+
+        let result = stream_alkis_features(path, |feat: SurfaceFeature| -> Result<()> {
+            let bb = match ring_xy_bbox(&feat.exterior) {
+                Some(b) => b,
+                None => return Ok(()),
+            };
+            for tile in tiles {
+                if tile.bbox().intersects(bb) {
+                    per_tile
+                        .entry(tile.name.clone())
+                        .or_default()
+                        .push(feat.clone());
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = result {
+            eprintln!("WARN: error in {}: {e}", path.display());
+        }
+        pb.inc(1);
+    }
+    pb.finish_with_message("ALKIS streamed");
+
+    // Stage 2: per tile, load terrain, build/clip/write each feature.
+    let pb = progress_bar(tiles.len() as u64, "road tiles");
+    let mut total_pieces: u64 = 0;
+    for tile in tiles {
+        pb.set_message(tile.name.clone());
+        let features = match per_tile.get(&tile.name) {
+            Some(f) if !f.is_empty() => f,
+            _ => {
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        let terrain = match read_tile_terrain(tile) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("WARN: terrain read failed for {}: {e}", tile.name);
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        let path = cli.output.join(&tile.name).join("road.obj");
+        let mut writer = ObjWriter::open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        writer.write_comment("city-obj-creator — roads")?;
+        writer.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
+        writer.write_comment(&format!(
+            "tile_origin_utm: x={:.3} y={:.3}",
+            tile.origin_x, tile.origin_y
+        ))?;
+        writer.write_newline()?;
+
+        let tile_bbox = tile.bbox();
+        for feat in features {
+            let (piece_v, piece_t) = build_manifold_road(feat, &terrain, tile_bbox);
+            if piece_v.is_empty() || piece_t.is_empty() {
+                continue;
+            }
+            if let Some(area) = xy_bbox(&piece_v).map(bbox_area)
+                && area < MIN_PIECE_AREA_M2
+            {
+                continue;
+            }
+
+            check_manifold(&format!("Road_{}@{}", feat.id, tile.name), &piece_t);
+
+            let name = sanitize_id(&feat.id);
+            writer.write_object(&format!("Road_{name}"))?;
+            let base = writer.write_vertices(&piece_v, tile.obj_origin())?;
+            writer.write_faces(&piece_t, base)?;
+            writer.write_newline()?;
+            total_pieces += 1;
+        }
+
+        writer.flush()?;
+        pb.inc(1);
+    }
+    pb.finish_with_message("roads done");
+
+    println!("Wrote {total_pieces} road piece(s)");
+    Ok(())
+}
+
+fn ring_xy_bbox(ring: &[DVec2]) -> Option<BBox2> {
+    if ring.is_empty() {
+        return None;
+    }
+    let mut xmin = f64::INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for p in ring {
+        if p.x < xmin {
+            xmin = p.x;
+        }
+        if p.y < ymin {
+            ymin = p.y;
+        }
+        if p.x > xmax {
+            xmax = p.x;
+        }
+        if p.y > ymax {
+            ymax = p.y;
+        }
+    }
+    Some(BBox2 {
+        xmin,
+        ymin,
+        xmax,
+        ymax,
+    })
 }
 
 fn xy_bbox(verts: &[DVec3]) -> Option<BBox2> {

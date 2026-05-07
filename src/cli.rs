@@ -17,6 +17,11 @@ pub struct Cli {
     #[arg(long)]
     pub dgm1: PathBuf,
 
+    /// Optional directory containing ALKIS .xml files (AX_Bestandsdatenauszug).
+    /// When set, a `road.obj` is emitted per tile from AX_Strassenverkehr features.
+    #[arg(long)]
+    pub alkis: Option<PathBuf>,
+
     /// Output directory for .obj files (created if it doesn't exist)
     #[arg(long, short, default_value = "output")]
     pub output: PathBuf,
