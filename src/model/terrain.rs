@@ -20,7 +20,4 @@ impl GlobalTerrain {
     pub fn z_at(&self, col: usize, row: usize) -> f64 {
         self.z[row * self.cols + col]
     }
-    pub fn min_z(&self) -> f64 {
-        self.z.iter().copied().filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min)
-    }
 }

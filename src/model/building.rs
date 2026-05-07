@@ -26,21 +26,3 @@ pub struct Building {
     pub surfaces: Vec<Surface>,
 }
 
-impl Building {
-    /// Compute the bounding box of all surface vertices.
-    pub fn bounds(&self) -> Option<(DVec3, DVec3)> {
-        let mut min = DVec3::splat(f64::INFINITY);
-        let mut max = DVec3::splat(f64::NEG_INFINITY);
-        let mut any = false;
-        for s in &self.surfaces {
-            for p in &s.polygons {
-                for v in &p.0 {
-                    min = min.min(*v);
-                    max = max.max(*v);
-                    any = true;
-                }
-            }
-        }
-        if any { Some((min, max)) } else { None }
-    }
-}

@@ -11,9 +11,11 @@ pub struct Cli {
     #[arg(long)]
     pub citygml: PathBuf,
 
-    /// Directory containing DGM1 .tif GeoTIFF elevation files
+    /// Directory containing DGM1 .tif GeoTIFF elevation files. Required:
+    /// each tile becomes its own output sub-folder, and tiles also drive
+    /// how buildings are partitioned into folders.
     #[arg(long)]
-    pub dgm1: Option<PathBuf>,
+    pub dgm1: PathBuf,
 
     /// Output directory for .obj files (created if it doesn't exist)
     #[arg(long, short, default_value = "output")]

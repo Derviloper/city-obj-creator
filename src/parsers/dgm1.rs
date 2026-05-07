@@ -7,14 +7,13 @@ use tiff::{
 };
 
 use crate::model::terrain::GlobalTerrain;
+use crate::model::tile::Tile;
 
 // GDAL nodata tag
 const TAG_GDAL_NODATA: u16 = 42113;
 
-/// Elevation grid for one DGM1 GeoTIFF tile, used internally to merge tiles
-/// into a `GlobalTerrain`. Geo-transform is read separately via
-/// `read_tile_meta`; this struct only carries pixels + dimensions.
-struct TerrainTile {
+/// Pixel data of a single DGM1 GeoTIFF tile.
+struct TilePixels {
     cols: usize,
     rows: usize,
     z: Vec<f64>,
@@ -22,14 +21,12 @@ struct TerrainTile {
 
 /// Read pixel data from a single DGM1 GeoTIFF tile.
 /// The tile must be a single-band float raster in ETRS89/UTM32N (EPSG:25832).
-fn read_tile(path: &Path) -> Result<TerrainTile> {
+fn read_tile_pixels(path: &Path) -> Result<TilePixels> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("opening DGM1 tile: {}", path.display()))?;
-    let mut dec = Decoder::new(file)
-        .context("creating TIFF decoder")?;
+    let mut dec = Decoder::new(file).context("creating TIFF decoder")?;
 
-    let (cols, rows) = dec.dimensions()
-        .context("reading TIFF dimensions")?;
+    let (cols, rows) = dec.dimensions().context("reading TIFF dimensions")?;
     let cols = cols as usize;
     let rows = rows as usize;
 
@@ -46,7 +43,7 @@ fn read_tile(path: &Path) -> Result<TerrainTile> {
     let raw = dec.read_image().context("reading TIFF image data")?;
     let z = raster_to_f64(raw, cols * rows, nodata);
 
-    Ok(TerrainTile { cols, rows, z })
+    Ok(TilePixels { cols, rows, z })
 }
 
 fn extract_geo_transform(
@@ -135,32 +132,41 @@ fn raster_to_f64(result: DecodingResult, expected: usize, nodata: Option<f64>) -
     // Treat a value as nodata if it equals the declared nodata value (within float tolerance),
     // or falls below a hard floor of -1_000_000 to catch common sentinel values.
     let is_nodata = move |f: f64| -> bool {
-        if let Some(nd) = nodata {
-            // Use relative comparison for large values
-            if (f - nd).abs() < 1.0 {
-                return true;
-            }
+        if let Some(nd) = nodata
+            && (f - nd).abs() < 1.0
+        {
+            return true;
         }
         f < -1_000_000.0
     };
 
     match result {
-        DecodingResult::F32(v) => v.into_iter().map(|x| {
-            let f = x as f64;
-            if is_nodata(f) { f64::NAN } else { f }
-        }).collect(),
-        DecodingResult::F64(v) => v.into_iter().map(|x| {
-            if is_nodata(x) { f64::NAN } else { x }
-        }).collect(),
-        DecodingResult::I16(v) => v.into_iter().map(|x| {
-            let f = x as f64;
-            if is_nodata(f) { f64::NAN } else { f }
-        }).collect(),
+        DecodingResult::F32(v) => v
+            .into_iter()
+            .map(|x| {
+                let f = x as f64;
+                if is_nodata(f) { f64::NAN } else { f }
+            })
+            .collect(),
+        DecodingResult::F64(v) => v
+            .into_iter()
+            .map(|x| if is_nodata(x) { f64::NAN } else { x })
+            .collect(),
+        DecodingResult::I16(v) => v
+            .into_iter()
+            .map(|x| {
+                let f = x as f64;
+                if is_nodata(f) { f64::NAN } else { f }
+            })
+            .collect(),
         DecodingResult::U16(v) => v.into_iter().map(|x| x as f64).collect(),
-        DecodingResult::I32(v) => v.into_iter().map(|x| {
-            let f = x as f64;
-            if is_nodata(f) { f64::NAN } else { f }
-        }).collect(),
+        DecodingResult::I32(v) => v
+            .into_iter()
+            .map(|x| {
+                let f = x as f64;
+                if is_nodata(f) { f64::NAN } else { f }
+            })
+            .collect(),
         DecodingResult::U32(v) => v.into_iter().map(|x| x as f64).collect(),
         DecodingResult::U8(v) => v.into_iter().map(|x| x as f64).collect(),
         _ => vec![f64::NAN; expected],
@@ -176,9 +182,7 @@ pub fn collect_tif_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
         .filter(|p| {
             p.is_file()
                 && p.extension()
-                    .map(|ext| {
-                        ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff")
-                    })
+                    .map(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
                     .unwrap_or(false)
         })
         .collect();
@@ -186,25 +190,21 @@ pub fn collect_tif_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
-/// Lightweight tile metadata: extent + dimensions + path.
-struct TileMeta {
-    path: std::path::PathBuf,
-    origin_x: f64,
-    origin_y: f64,
-    res: f64,
-    cols: usize,
-    rows: usize,
-}
-
 /// Read just the geo-transform of a TIFF without decoding pixel data.
-fn read_tile_meta(path: &Path) -> Result<TileMeta> {
+/// Returns a fully-populated `Tile` (path + dimensions + origin).
+fn read_tile_meta(path: &Path) -> Result<Tile> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("opening DGM1 tile: {}", path.display()))?;
-    let mut dec = Decoder::new(file)
-        .context("creating TIFF decoder")?;
+    let mut dec = Decoder::new(file).context("creating TIFF decoder")?;
     let (cols, rows) = dec.dimensions().context("reading TIFF dimensions")?;
     let (origin_x, origin_y, res) = extract_geo_transform(&mut dec, path)?;
-    Ok(TileMeta {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tile")
+        .to_string();
+    Ok(Tile {
+        name,
         path: path.to_path_buf(),
         origin_x,
         origin_y,
@@ -214,110 +214,40 @@ fn read_tile_meta(path: &Path) -> Result<TileMeta> {
     })
 }
 
-/// Read all DGM1 tiles in a directory and merge them into one combined elevation grid.
-/// Adjacent tiles are stitched at their shared boundary pixels (no duplication, no seams).
-///
-/// Memory cost: peak ≈ size of the combined grid (8 bytes per pixel) + one tile.
-pub fn read_global_terrain(dir: &Path) -> Result<Option<GlobalTerrain>> {
+/// List every DGM1 tile in `dir`, returning their geo-metadata (no pixels).
+pub fn list_tiles(dir: &Path) -> Result<Vec<Tile>> {
     let tif_files = collect_tif_files(dir)?;
-    if tif_files.is_empty() {
-        return Ok(None);
-    }
-
-    // Pass 1: read metadata of every tile.
-    let mut metas: Vec<TileMeta> = Vec::new();
+    let mut tiles = Vec::with_capacity(tif_files.len());
     for path in &tif_files {
-        let m = match read_tile_meta(path) {
-            Ok(m) => m,
+        match read_tile_meta(path) {
+            Ok(t) => tiles.push(t),
             Err(e) => {
                 eprintln!("WARN: skipping {}: {e}", path.display());
-                continue;
             }
-        };
-        metas.push(m);
-    }
-
-    if metas.is_empty() {
-        return Ok(None);
-    }
-
-    // All tiles must share the same resolution (true for DGM1 = 1m).
-    let res = metas[0].res;
-    anyhow::ensure!(
-        metas.iter().all(|m| (m.res - res).abs() < 1e-6),
-        "DGM1 tiles have inconsistent resolutions"
-    );
-
-    // Compute combined extent from all tile pixel centers.
-    let global_xmin = metas.iter().map(|m| m.origin_x).fold(f64::INFINITY, f64::min);
-    let global_ymax = metas.iter().map(|m| m.origin_y).fold(f64::NEG_INFINITY, f64::max);
-    let global_xmax = metas
-        .iter()
-        .map(|m| m.origin_x + (m.cols as f64 - 1.0) * m.res)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let global_ymin = metas
-        .iter()
-        .map(|m| m.origin_y - (m.rows as f64 - 1.0) * m.res)
-        .fold(f64::INFINITY, f64::min);
-
-    let cols = ((global_xmax - global_xmin) / res).round() as usize + 1;
-    let rows = ((global_ymax - global_ymin) / res).round() as usize + 1;
-
-    let mut z = vec![f64::NAN; cols * rows];
-
-    // Pass 2: read each tile's pixels and copy into the right slot of the global grid.
-    let pb = indicatif::ProgressBar::new(metas.len() as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40} {pos}/{len} merging tiles {msg}",
-        )
-        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar()),
-    );
-
-    for m in &metas {
-        pb.set_message(
-            m.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string(),
-        );
-
-        let tile = match read_tile(&m.path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("WARN: skipping {}: {e}", m.path.display());
-                pb.inc(1);
-                continue;
-            }
-        };
-
-        let col_offset = ((m.origin_x - global_xmin) / res).round() as usize;
-        let row_offset = ((global_ymax - m.origin_y) / res).round() as usize;
-
-        for r in 0..tile.rows {
-            let dst_row = row_offset + r;
-            if dst_row >= rows {
-                break;
-            }
-            let dst_base = dst_row * cols + col_offset;
-            let src_base = r * tile.cols;
-            let copy_cols = tile.cols.min(cols.saturating_sub(col_offset));
-            // Overwrite (later tile wins on the 1-pixel boundary overlap, values match).
-            z[dst_base..dst_base + copy_cols]
-                .copy_from_slice(&tile.z[src_base..src_base + copy_cols]);
         }
-        pb.inc(1);
-        // tile dropped here -> memory freed
     }
-    pb.finish_with_message("done");
+    Ok(tiles)
+}
 
-    Ok(Some(GlobalTerrain {
-        origin_x: global_xmin,
-        origin_y: global_ymax,
-        res,
-        cols,
-        rows,
-        z,
-    }))
+/// Read a tile's pixels and wrap them in a `GlobalTerrain` (single-tile grid).
+/// Memory cost: one tile's worth of f64s (≈ cols*rows * 8 bytes).
+pub fn read_tile_terrain(tile: &Tile) -> Result<GlobalTerrain> {
+    let pixels = read_tile_pixels(&tile.path)?;
+    anyhow::ensure!(
+        pixels.cols == tile.cols && pixels.rows == tile.rows,
+        "pixel dimensions {}x{} of {} don't match metadata {}x{}",
+        pixels.cols,
+        pixels.rows,
+        tile.path.display(),
+        tile.cols,
+        tile.rows,
+    );
+    Ok(GlobalTerrain {
+        origin_x: tile.origin_x,
+        origin_y: tile.origin_y,
+        res: tile.res,
+        cols: pixels.cols,
+        rows: pixels.rows,
+        z: pixels.z,
+    })
 }

@@ -4,143 +4,185 @@ mod geometry;
 mod model;
 mod parsers;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use glam::DVec3;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use cli::Cli;
 use export::obj::ObjWriter;
-use geometry::manifold::{build_manifold_building, build_manifold_global_terrain};
+use geometry::clip::clip_mesh_to_aabb_xy;
+use geometry::manifold::{build_manifold_building, build_manifold_global_terrain, check_manifold};
 use model::building::Building;
+use model::tile::{BBox2, Tile};
 use parsers::{
     citygml::{collect_gml_files, stream_buildings},
-    dgm1::read_global_terrain,
+    dgm1::{list_tiles, read_tile_terrain},
 };
+
+/// Skip clipped building pieces whose XY footprint is below this many m².
+/// Anything smaller is almost certainly a numerical sliver from a building
+/// that just barely overlaps a tile boundary.
+const MIN_PIECE_AREA_M2: f64 = 1e-3;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     std::fs::create_dir_all(&cli.output)?;
 
-    // A single global XY origin shared by both terrain and buildings.
-    // All output coordinates are (utm_x - origin.x, utm_y - origin.y, utm_z).
-    // This keeps values small for 3D viewer compatibility while preserving
-    // relative positions between all objects. Set from first data encountered.
-    let mut global_origin: Option<DVec3> = None;
-
     // ------------------------------------------------------------------
-    // Terrain: merge all DGM1 tiles into one combined elevation grid,
-    // build a single watertight mesh, write it out.
+    // Discover tiles: every output sub-folder corresponds to one .tif.
     // ------------------------------------------------------------------
-    if let Some(dgm1_dir) = &cli.dgm1 {
-        match read_global_terrain(dgm1_dir)? {
-            None => {
-                eprintln!("WARN: no DGM1 tiles loaded from {}", dgm1_dir.display());
-            }
-            Some(grid) => {
-                let origin = *global_origin
-                    .get_or_insert_with(|| DVec3::new(grid.origin_x, grid.origin_y, 0.0));
+    let tiles = list_tiles(&cli.dgm1)?;
+    if tiles.is_empty() {
+        eprintln!("ERROR: no DGM1 tiles found in {}", cli.dgm1.display());
+        std::process::exit(1);
+    }
+    println!("Found {} DGM1 tile(s)", tiles.len());
 
-                let terrain_path = cli.output.join("terrain.obj");
-                let mut writer = ObjWriter::open(&terrain_path)?;
-                writer.write_comment("city-obj-creator — terrain")?;
-                writer.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
-                writer.write_comment(&format!(
-                    "global_origin_utm: x={:.3} y={:.3}",
-                    origin.x, origin.y
-                ))?;
-                writer.write_newline()?;
-
-                let build_pb = ProgressBar::new_spinner();
-                build_pb.set_style(
-                    ProgressStyle::with_template("[{elapsed_precise}] {spinner} {msg}")
-                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-                );
-                build_pb.enable_steady_tick(Duration::from_millis(100));
-                build_pb.set_message(format!(
-                    "building terrain mesh ({}×{} cells)",
-                    grid.cols, grid.rows
-                ));
-                let (verts, faces) = build_manifold_global_terrain(&grid);
-                build_pb.finish_with_message(format!(
-                    "terrain mesh built: {} vertices, {} triangles",
-                    verts.len(),
-                    faces.len()
-                ));
-
-                if !verts.is_empty() {
-                    writer.write_object("Terrain")?;
-                    let base = write_vertices_chunked(&mut writer, &verts, origin, "writing terrain vertices")?;
-                    write_faces_chunked(&mut writer, &faces, base, "writing terrain faces")?;
-                }
-
-                let flush_pb = ProgressBar::new_spinner();
-                flush_pb.set_style(
-                    ProgressStyle::with_template("[{elapsed_precise}] {spinner} {msg}")
-                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-                );
-                flush_pb.enable_steady_tick(Duration::from_millis(100));
-                flush_pb.set_message("flushing terrain.obj");
-                writer.flush()?;
-                flush_pb.finish_with_message("terrain.obj flushed");
-                println!(
-                    "Terrain written to {} ({} vertices, {} triangles)",
-                    terrain_path.display(),
-                    verts.len(),
-                    faces.len()
-                );
-            }
-        }
+    // Pre-create one sub-folder per tile.
+    for tile in &tiles {
+        let dir = cli.output.join(&tile.name);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating output sub-folder {}", dir.display()))?;
     }
 
     // ------------------------------------------------------------------
-    // Buildings: stream one GML file at a time, write incrementally.
-    // All buildings share the same global origin established above.
+    // Phase 1: terrain. Each tile is its own watertight solid.
     // ------------------------------------------------------------------
+    write_per_tile_terrain(&tiles, &cli.output)?;
+
+    // ------------------------------------------------------------------
+    // Phase 2: buildings. Stream GMLs, clip each building to overlapping
+    // tiles, write per-tile pieces.
+    // ------------------------------------------------------------------
+    write_per_tile_buildings(&tiles, &cli)?;
+
+    println!("Done.");
+    Ok(())
+}
+
+fn write_per_tile_terrain(tiles: &[Tile], output: &std::path::Path) -> Result<()> {
+    let pb = progress_bar(tiles.len() as u64, "terrain tiles");
+    for tile in tiles {
+        pb.set_message(tile.name.clone());
+
+        let grid = match read_tile_terrain(tile) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("WARN: terrain read failed for {}: {e}", tile.name);
+                pb.inc(1);
+                continue;
+            }
+        };
+        let (verts, faces) = build_manifold_global_terrain(&grid);
+        if verts.is_empty() || faces.is_empty() {
+            pb.inc(1);
+            continue;
+        }
+
+        let path = output.join(&tile.name).join("terrain.obj");
+        let mut writer = ObjWriter::open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        writer.write_comment("city-obj-creator — terrain")?;
+        writer.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
+        writer.write_comment(&format!(
+            "tile_origin_utm: x={:.3} y={:.3}",
+            tile.origin_x, tile.origin_y
+        ))?;
+        writer.write_newline()?;
+        writer.write_object("Terrain")?;
+        let base = writer.write_vertices(&verts, tile.obj_origin())?;
+        writer.write_faces(&faces, base)?;
+        writer.flush()?;
+
+        check_manifold(&format!("terrain[{}]", tile.name), &faces);
+        pb.inc(1);
+    }
+    pb.finish_with_message("terrain done");
+    Ok(())
+}
+
+fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli) -> Result<()> {
     let gml_files = collect_gml_files(&cli.citygml)?;
     if gml_files.is_empty() {
         eprintln!("WARN: no .gml/.xml files found in {}", cli.citygml.display());
         return Ok(());
     }
 
-    let buildings_path = cli.output.join("buildings.obj");
-    let mut writer = ObjWriter::open(&buildings_path)?;
-    writer.write_comment("city-obj-creator — buildings")?;
-    writer.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
-    writer.write_newline()?;
+    // Open one writer per tile up front; close them all at the end.
+    let mut writers: HashMap<String, ObjWriter> = HashMap::with_capacity(tiles.len());
+    for tile in tiles {
+        let path = cli.output.join(&tile.name).join("buildings.obj");
+        let mut w = ObjWriter::open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        w.write_comment("city-obj-creator — buildings")?;
+        w.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
+        w.write_comment(&format!(
+            "tile_origin_utm: x={:.3} y={:.3}",
+            tile.origin_x, tile.origin_y
+        ))?;
+        w.write_newline()?;
+        writers.insert(tile.name.clone(), w);
+    }
 
     let pb = progress_bar(gml_files.len() as u64, "CityGML files");
+    let mut tile_building_counts: HashMap<String, u64> = HashMap::new();
 
     for path in &gml_files {
-        pb.set_message(
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string(),
-        );
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        pb.set_message(file_name.clone());
 
-        let result = stream_buildings(path, |building: Building| {
-            let (verts, faces) = build_manifold_building(&building);
-            if verts.is_empty() || faces.is_empty() {
+        let result = stream_buildings(path, |building: Building| -> Result<()> {
+            let (verts, tris) = build_manifold_building(&building);
+            if verts.is_empty() || tris.is_empty() {
                 return Ok(());
             }
+            let bldg_bbox = match xy_bbox(&verts) {
+                Some(b) => b,
+                None => return Ok(()),
+            };
 
-            // Lock global origin from the first building if terrain wasn't processed.
-            let origin = *global_origin.get_or_insert_with(|| {
-                building
-                    .bounds()
-                    .map(|(bmin, _)| DVec3::new(bmin.x, bmin.y, 0.0))
-                    .unwrap_or(DVec3::ZERO)
-            });
+            for tile in tiles {
+                let tile_bbox = tile.bbox();
+                if !tile_bbox.intersects(bldg_bbox) {
+                    continue;
+                }
 
-            let name = sanitize_id(&building.id);
-            writer.write_object(&format!("Building_{name}"))?;
-            let base = writer.write_vertices(&verts, origin)?;
-            writer.write_faces(&faces, base)?;
-            writer.write_newline()?;
+                // Fast path: building fully inside this tile, no clip needed.
+                let (piece_v, piece_t) = if tile_bbox.contains_bbox(bldg_bbox) {
+                    (verts.clone(), tris.clone())
+                } else {
+                    clip_mesh_to_aabb_xy(&verts, &tris, tile_bbox)
+                };
+
+                if piece_v.is_empty() || piece_t.is_empty() {
+                    continue;
+                }
+                if let Some(area) = xy_bbox(&piece_v).map(bbox_area)
+                    && area < MIN_PIECE_AREA_M2
+                {
+                    continue;
+                }
+
+                check_manifold(&format!("{}@{}", building.id, tile.name), &piece_t);
+
+                let writer = writers
+                    .get_mut(&tile.name)
+                    .expect("writer must exist for known tile");
+                let name = sanitize_id(&building.id);
+                writer.write_object(&format!("Building_{name}"))?;
+                let base = writer.write_vertices(&piece_v, tile.obj_origin())?;
+                writer.write_faces(&piece_t, base)?;
+                writer.write_newline()?;
+                *tile_building_counts.entry(tile.name.clone()).or_default() += 1;
+            }
             Ok(())
         });
 
@@ -149,70 +191,84 @@ fn main() -> Result<()> {
         }
         pb.inc(1);
     }
+    pb.finish_with_message("buildings done");
 
-    if let Some(origin) = global_origin {
-        writer.write_comment(&format!(
-            "global_origin_utm: x={:.3} y={:.3}",
-            origin.x, origin.y
-        ))?;
+    // Final flush + spinner.
+    let flush_pb = ProgressBar::new_spinner();
+    flush_pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] {spinner} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    flush_pb.enable_steady_tick(Duration::from_millis(100));
+    flush_pb.set_message("flushing buildings.obj files");
+    for (_, mut writer) in writers.drain() {
+        writer.flush()?;
     }
+    flush_pb.finish_with_message("buildings flushed");
 
-    pb.finish_with_message("done");
-    writer.flush()?;
-    println!("Buildings written to {}", buildings_path.display());
-
+    let total_pieces: u64 = tile_building_counts.values().sum();
+    println!(
+        "Wrote {} building piece(s) across {} tile folder(s)",
+        total_pieces,
+        tile_building_counts.len()
+    );
     Ok(())
+}
+
+fn xy_bbox(verts: &[DVec3]) -> Option<BBox2> {
+    if verts.is_empty() {
+        return None;
+    }
+    let mut xmin = f64::INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for v in verts {
+        if v.x < xmin {
+            xmin = v.x;
+        }
+        if v.y < ymin {
+            ymin = v.y;
+        }
+        if v.x > xmax {
+            xmax = v.x;
+        }
+        if v.y > ymax {
+            ymax = v.y;
+        }
+    }
+    Some(BBox2 {
+        xmin,
+        ymin,
+        xmax,
+        ymax,
+    })
+}
+
+fn bbox_area(b: BBox2) -> f64 {
+    (b.xmax - b.xmin).max(0.0) * (b.ymax - b.ymin).max(0.0)
 }
 
 fn progress_bar(len: u64, label: &str) -> ProgressBar {
     let pb = ProgressBar::new(len);
     pb.set_style(
-        ProgressStyle::with_template(
-            &format!("[{{elapsed_precise}}] {{bar:40}} {{pos}}/{{len}} {label} {{msg}}"),
-        )
+        ProgressStyle::with_template(&format!(
+            "[{{elapsed_precise}}] {{bar:40}} {{pos}}/{{len}} {label} {{msg}}"
+        ))
         .unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
     pb
 }
 
-/// Write vertices to the OBJ writer in chunks so a progress bar can advance.
-/// Returns the base vertex index of the first chunk (suitable for face refs).
-fn write_vertices_chunked(
-    writer: &mut ObjWriter,
-    verts: &[DVec3],
-    origin: DVec3,
-    label: &str,
-) -> Result<u64> {
-    const CHUNK: usize = 100_000;
-    let pb = progress_bar(verts.len() as u64, label);
-    let mut first_base: Option<u64> = None;
-    for chunk in verts.chunks(CHUNK) {
-        let base = writer.write_vertices(chunk, origin)?;
-        first_base.get_or_insert(base);
-        pb.inc(chunk.len() as u64);
-    }
-    pb.finish_with_message("done");
-    Ok(first_base.unwrap_or(writer.vertex_count))
-}
-
-fn write_faces_chunked(
-    writer: &mut ObjWriter,
-    faces: &[[u32; 3]],
-    base: u64,
-    label: &str,
-) -> Result<()> {
-    const CHUNK: usize = 100_000;
-    let pb = progress_bar(faces.len() as u64, label);
-    for chunk in faces.chunks(CHUNK) {
-        writer.write_faces(chunk, base)?;
-        pb.inc(chunk.len() as u64);
-    }
-    pb.finish_with_message("done");
-    Ok(())
-}
-
 fn sanitize_id(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
+

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 /// Warn if the mesh has boundary edges or over-shared edges (non-manifold indicators).
-pub(super) fn check_manifold(building_id: &str, tris: &[[u32; 3]]) {
+pub fn check_manifold(building_id: &str, tris: &[[u32; 3]]) {
     let mut edge_count: HashMap<(u32, u32), usize> = HashMap::new();
     for tri in tris {
         for e in 0..3 {
