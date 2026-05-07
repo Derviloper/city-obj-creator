@@ -43,27 +43,4 @@ impl Building {
         }
         if any { Some((min, max)) } else { None }
     }
-
-    /// Average of xy across every vertex; z is forced to 0. Used as a
-    /// reference point for outward-normal heuristics where z is irrelevant.
-    pub fn centroid_xy(&self) -> Option<DVec3> {
-        let mut sx = 0.0;
-        let mut sy = 0.0;
-        let mut count = 0usize;
-        for s in &self.surfaces {
-            for p in &s.polygons {
-                for v in &p.0 {
-                    sx += v.x;
-                    sy += v.y;
-                    count += 1;
-                }
-            }
-        }
-        if count > 0 {
-            let n = count as f64;
-            Some(DVec3::new(sx / n, sy / n, 0.0))
-        } else {
-            None
-        }
-    }
 }

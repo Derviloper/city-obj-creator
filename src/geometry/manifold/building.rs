@@ -11,10 +11,7 @@ use super::{
     repair::{orient_consistently, repair_overshared_edges},
 };
 use crate::{
-    geometry::{
-        normals::{ear_clip_triangulate, polygon_normal},
-        vertex_merge::VertexMerger,
-    },
+    geometry::{normals::ear_clip_triangulate, vertex_merge::VertexMerger},
     model::building::{Building, SurfaceType},
 };
 
@@ -128,19 +125,22 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
     close_open_boundary_loops(&mut polygons, BUILDING_TOL);
 
     // ---- (9) Triangulate, merge vertices, repair, orient. ----
+    //
+    // We don't try to flip individual faces toward an "expected" outward
+    // normal here. The downstream `orient_consistently` pass propagates a
+    // consistent winding via BFS over face adjacency and then flips each
+    // closed component to outward via signed-volume — that is sufficient and
+    // strictly more reliable than a per-face heuristic, which is wrong for
+    // walls at concave corners. Empirically, omitting the per-face flip
+    // produces byte-identical output across the LVermGeo test set.
     let mut merger = VertexMerger::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
 
-    let centroid = building.centroid_xy().unwrap_or(DVec3::ZERO);
-
-    for (surface_type, verts) in &polygons {
+    for (_surface_type, verts) in &polygons {
         if verts.len() < 3 {
             continue;
         }
         let indices: Vec<u32> = verts.iter().map(|v| merger.insert(*v)).collect();
-
-        let normal = polygon_normal(verts);
-        let expected_outward = expected_normal_direction(*surface_type, centroid, verts);
 
         // Ear-clipping (rather than naive fan-triangulation) picks each
         // diagonal based on local convexity, so two unrelated polygons that
@@ -158,18 +158,13 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
                 .map(|t| [indices[t[0]], indices[t[1]], indices[t[2]]])
                 .collect()
         };
-        let flip = normal.dot(expected_outward) < 0.0;
 
         for tri in raw_tris {
             // Drop degenerate triangles created by collinear/duplicate vertices.
             if tri[0] == tri[1] || tri[1] == tri[2] || tri[0] == tri[2] {
                 continue;
             }
-            if flip {
-                tris.push([tri[0], tri[2], tri[1]]);
-            } else {
-                tris.push(tri);
-            }
+            tris.push(tri);
         }
     }
 
@@ -183,31 +178,4 @@ pub fn build_manifold_building(building: &Building) -> (Vec<DVec3>, Vec<[u32; 3]
     check_manifold(building.id.as_str(), &tris);
 
     (merger.verts, tris)
-}
-
-/// Determine the expected outward normal direction for a surface.
-fn expected_normal_direction(
-    surface_type: SurfaceType,
-    centroid_xy: DVec3,
-    polygon_verts: &[DVec3],
-) -> DVec3 {
-    match surface_type {
-        SurfaceType::Roof => DVec3::Z,
-        SurfaceType::Ground => -DVec3::Z,
-        SurfaceType::Wall | SurfaceType::Closure | SurfaceType::Unknown => {
-            // Outward from building xy-centroid (centroid.z is 0 by construction).
-            let face_center = polygon_verts.iter().copied().sum::<DVec3>()
-                / polygon_verts.len() as f64;
-            let outward = DVec3::new(
-                face_center.x - centroid_xy.x,
-                face_center.y - centroid_xy.y,
-                0.0,
-            );
-            if outward.length_squared() > 1e-10 {
-                outward.normalize()
-            } else {
-                DVec3::X
-            }
-        }
-    }
 }
