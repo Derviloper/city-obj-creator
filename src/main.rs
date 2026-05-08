@@ -18,7 +18,7 @@ use geometry::clip::clip_mesh_to_aabb_xy;
 use geometry::manifold::{
     build_manifold_building, build_manifold_global_terrain, build_manifold_road, check_manifold,
 };
-use model::alkis::SurfaceFeature;
+use model::alkis::{AlkisKind, SurfaceFeature};
 use model::building::Building;
 use model::tile::{BBox2, Tile};
 use parsers::{
@@ -65,11 +65,11 @@ fn main() -> Result<()> {
     write_per_tile_buildings(&tiles, &cli)?;
 
     // ------------------------------------------------------------------
-    // Phase 3: roads (optional). Stream ALKIS, extrude over terrain,
-    // clip to tile bbox, write per-tile road.obj.
+    // Phase 3: ALKIS surface features (optional). Stream ALKIS, extrude
+    // over terrain, clip to tile bbox, write per-tile road.obj / rail.obj.
     // ------------------------------------------------------------------
     if cli.alkis.is_some() {
-        write_per_tile_roads(&tiles, &cli)?;
+        write_per_tile_alkis(&tiles, &cli)?;
     }
 
     println!("Done.");
@@ -227,7 +227,19 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn write_per_tile_roads(tiles: &[Tile], cli: &Cli) -> Result<()> {
+/// Per-kind output configuration: filename, header label, and OBJ object-name
+/// prefix. Adding a new ALKIS surface kind is one entry here plus a parser
+/// match arm and an `AlkisKind` variant.
+fn alkis_kind_output(kind: AlkisKind) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        AlkisKind::Strassenverkehr => ("road.obj", "roads", "Road"),
+        AlkisKind::Bahnverkehr => ("rail.obj", "rail", "Rail"),
+    }
+}
+
+const ALKIS_KINDS: &[AlkisKind] = &[AlkisKind::Strassenverkehr, AlkisKind::Bahnverkehr];
+
+fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
     let alkis_dir = match cli.alkis.as_ref() {
         Some(d) => d,
         None => return Ok(()),
@@ -273,9 +285,10 @@ fn write_per_tile_roads(tiles: &[Tile], cli: &Cli) -> Result<()> {
     }
     pb.finish_with_message("ALKIS streamed");
 
-    // Stage 2: per tile, load terrain, build/clip/write each feature.
-    let pb = progress_bar(tiles.len() as u64, "road tiles");
-    let mut total_pieces: u64 = 0;
+    // Stage 2: per tile, load terrain once, build/clip/write each feature
+    // routed to the per-kind writer.
+    let pb = progress_bar(tiles.len() as u64, "ALKIS tiles");
+    let mut total_pieces: HashMap<AlkisKind, u64> = HashMap::new();
     for tile in tiles {
         pb.set_message(tile.name.clone());
         let features = match per_tile.get(&tile.name) {
@@ -295,17 +308,8 @@ fn write_per_tile_roads(tiles: &[Tile], cli: &Cli) -> Result<()> {
             }
         };
 
-        let path = cli.output.join(&tile.name).join("road.obj");
-        let mut writer = ObjWriter::open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        writer.write_comment("city-obj-creator — roads")?;
-        writer.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
-        writer.write_comment(&format!(
-            "tile_origin_utm: x={:.3} y={:.3}",
-            tile.origin_x, tile.origin_y
-        ))?;
-        writer.write_newline()?;
-
+        // Open one writer per kind that actually has features in this tile.
+        let mut writers: HashMap<AlkisKind, ObjWriter> = HashMap::new();
         let tile_bbox = tile.bbox();
         for feat in features {
             let (piece_v, piece_t) = build_manifold_road(feat, &terrain, tile_bbox);
@@ -318,22 +322,46 @@ fn write_per_tile_roads(tiles: &[Tile], cli: &Cli) -> Result<()> {
                 continue;
             }
 
-            check_manifold(&format!("Road_{}@{}", feat.id, tile.name), &piece_t);
+            let (filename, label, prefix) = alkis_kind_output(feat.kind);
+            check_manifold(&format!("{prefix}_{}@{}", feat.id, tile.name), &piece_t);
+
+            let writer = match writers.entry(feat.kind) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let path = cli.output.join(&tile.name).join(filename);
+                    let mut w = ObjWriter::open(&path)
+                        .with_context(|| format!("opening {}", path.display()))?;
+                    w.write_comment(&format!("city-obj-creator — {label}"))?;
+                    w.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
+                    w.write_comment(&format!(
+                        "tile_origin_utm: x={:.3} y={:.3}",
+                        tile.origin_x, tile.origin_y
+                    ))?;
+                    w.write_newline()?;
+                    e.insert(w)
+                }
+            };
 
             let name = sanitize_id(&feat.id);
-            writer.write_object(&format!("Road_{name}"))?;
+            writer.write_object(&format!("{prefix}_{name}"))?;
             let base = writer.write_vertices(&piece_v, tile.obj_origin())?;
             writer.write_faces(&piece_t, base)?;
             writer.write_newline()?;
-            total_pieces += 1;
+            *total_pieces.entry(feat.kind).or_default() += 1;
         }
 
-        writer.flush()?;
+        for (_, mut writer) in writers.drain() {
+            writer.flush()?;
+        }
         pb.inc(1);
     }
-    pb.finish_with_message("roads done");
+    pb.finish_with_message("ALKIS done");
 
-    println!("Wrote {total_pieces} road piece(s)");
+    for kind in ALKIS_KINDS {
+        let count = total_pieces.get(kind).copied().unwrap_or(0);
+        let (_, label, _) = alkis_kind_output(*kind);
+        println!("Wrote {count} {label} piece(s)");
+    }
     Ok(())
 }
 

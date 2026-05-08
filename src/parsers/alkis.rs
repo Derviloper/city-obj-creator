@@ -31,6 +31,7 @@ fn is_gml_ns(ns: &[u8]) -> bool {
 fn alkis_kind_from_local(local: &[u8]) -> Option<AlkisKind> {
     match local {
         b"AX_Strassenverkehr" => Some(AlkisKind::Strassenverkehr),
+        b"AX_Bahnverkehr" => Some(AlkisKind::Bahnverkehr),
         _ => None,
     }
 }
