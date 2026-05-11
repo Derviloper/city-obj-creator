@@ -1,11 +1,12 @@
 use glam::DVec2;
 
-/// Type tag for an ALKIS surface feature. Further variants (Weg, water
-/// bodies) will be added when their parsers / mesher tunings land.
+/// Type tag for an ALKIS surface feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AlkisKind {
     Strassenverkehr,
     Bahnverkehr,
+    Fliessgewaesser,
+    StehendesGewaesser,
 }
 
 /// A single 2D ALKIS surface feature as parsed from an AX_Bestandsdatenauszug.

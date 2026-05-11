@@ -16,7 +16,8 @@ use cli::Cli;
 use export::obj::ObjWriter;
 use geometry::clip::clip_mesh_to_aabb_xy;
 use geometry::manifold::{
-    build_manifold_building, build_manifold_global_terrain, build_manifold_road, check_manifold,
+    build_manifold_building, build_manifold_global_terrain, build_manifold_road,
+    build_manifold_water, check_manifold,
 };
 use model::alkis::{AlkisKind, SurfaceFeature};
 use model::building::Building;
@@ -234,10 +235,17 @@ fn alkis_kind_output(kind: AlkisKind) -> (&'static str, &'static str, &'static s
     match kind {
         AlkisKind::Strassenverkehr => ("road.obj", "roads", "Road"),
         AlkisKind::Bahnverkehr => ("rail.obj", "rail", "Rail"),
+        AlkisKind::Fliessgewaesser => ("water.obj", "water", "WaterFlow"),
+        AlkisKind::StehendesGewaesser => ("water.obj", "water", "WaterStill"),
     }
 }
 
-const ALKIS_KINDS: &[AlkisKind] = &[AlkisKind::Strassenverkehr, AlkisKind::Bahnverkehr];
+const ALKIS_KINDS: &[AlkisKind] = &[
+    AlkisKind::Strassenverkehr,
+    AlkisKind::Bahnverkehr,
+    AlkisKind::Fliessgewaesser,
+    AlkisKind::StehendesGewaesser,
+];
 
 fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
     let alkis_dir = match cli.alkis.as_ref() {
@@ -308,11 +316,20 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
             }
         };
 
-        // Open one writer per kind that actually has features in this tile.
-        let mut writers: HashMap<AlkisKind, ObjWriter> = HashMap::new();
+        // One writer per output filename in this tile. Keying by filename
+        // (not AlkisKind) lets several kinds share a file — e.g. both water
+        // kinds write into `water.obj` while keeping distinct object names.
+        let mut writers: HashMap<&'static str, ObjWriter> = HashMap::new();
         let tile_bbox = tile.bbox();
         for feat in features {
-            let (piece_v, piece_t) = build_manifold_road(feat, &terrain, tile_bbox);
+            let (piece_v, piece_t) = match feat.kind {
+                AlkisKind::Strassenverkehr | AlkisKind::Bahnverkehr => {
+                    build_manifold_road(feat, &terrain, tile_bbox)
+                }
+                AlkisKind::Fliessgewaesser | AlkisKind::StehendesGewaesser => {
+                    build_manifold_water(feat, &terrain, tile_bbox)
+                }
+            };
             if piece_v.is_empty() || piece_t.is_empty() {
                 continue;
             }
@@ -325,7 +342,7 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
             let (filename, label, prefix) = alkis_kind_output(feat.kind);
             check_manifold(&format!("{prefix}_{}@{}", feat.id, tile.name), &piece_t);
 
-            let writer = match writers.entry(feat.kind) {
+            let writer = match writers.entry(filename) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let path = cli.output.join(&tile.name).join(filename);

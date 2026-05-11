@@ -32,6 +32,8 @@ fn alkis_kind_from_local(local: &[u8]) -> Option<AlkisKind> {
     match local {
         b"AX_Strassenverkehr" => Some(AlkisKind::Strassenverkehr),
         b"AX_Bahnverkehr" => Some(AlkisKind::Bahnverkehr),
+        b"AX_Fliessgewaesser" => Some(AlkisKind::Fliessgewaesser),
+        b"AX_StehendesGewaesser" => Some(AlkisKind::StehendesGewaesser),
         _ => None,
     }
 }
