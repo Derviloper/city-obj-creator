@@ -5,6 +5,7 @@ use glam::DVec2;
 pub enum AlkisKind {
     Strassenverkehr,
     Bahnverkehr,
+    Weg,
     Fliessgewaesser,
     StehendesGewaesser,
 }

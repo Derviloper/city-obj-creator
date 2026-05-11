@@ -235,6 +235,7 @@ fn alkis_kind_output(kind: AlkisKind) -> (&'static str, &'static str, &'static s
     match kind {
         AlkisKind::Strassenverkehr => ("road.obj", "roads", "Road"),
         AlkisKind::Bahnverkehr => ("rail.obj", "rail", "Rail"),
+        AlkisKind::Weg => ("path.obj", "paths", "Path"),
         AlkisKind::Fliessgewaesser => ("water.obj", "water", "WaterFlow"),
         AlkisKind::StehendesGewaesser => ("water.obj", "water", "WaterStill"),
     }
@@ -243,6 +244,7 @@ fn alkis_kind_output(kind: AlkisKind) -> (&'static str, &'static str, &'static s
 const ALKIS_KINDS: &[AlkisKind] = &[
     AlkisKind::Strassenverkehr,
     AlkisKind::Bahnverkehr,
+    AlkisKind::Weg,
     AlkisKind::Fliessgewaesser,
     AlkisKind::StehendesGewaesser,
 ];
@@ -323,7 +325,7 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
         let tile_bbox = tile.bbox();
         for feat in features {
             let (piece_v, piece_t) = match feat.kind {
-                AlkisKind::Strassenverkehr | AlkisKind::Bahnverkehr => {
+                AlkisKind::Strassenverkehr | AlkisKind::Bahnverkehr | AlkisKind::Weg => {
                     build_manifold_road(feat, &terrain, tile_bbox)
                 }
                 AlkisKind::Fliessgewaesser | AlkisKind::StehendesGewaesser => {
