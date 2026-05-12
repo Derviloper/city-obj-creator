@@ -60,8 +60,23 @@ impl Tile {
         }
     }
 
-    /// Origin used when writing OBJ vertices (NW pixel center, z=0).
-    pub fn obj_origin(&self) -> DVec3 {
-        DVec3::new(self.origin_x, self.origin_y, 0.0)
+}
+
+/// Run-wide OBJ anchor: SW-most corner across all tiles. All vertex
+/// coordinates written with this origin are non-negative and grow east
+/// (x) / north (y). Z is 0 so terrain elevation values pass through
+/// verbatim. Returns None for an empty slice — callers should guard.
+pub fn shared_obj_origin(tiles: &[Tile]) -> Option<DVec3> {
+    if tiles.is_empty() {
+        return None;
     }
+    let sx = tiles
+        .iter()
+        .map(|t| t.bbox().xmin)
+        .fold(f64::INFINITY, f64::min);
+    let sy = tiles
+        .iter()
+        .map(|t| t.bbox().ymin)
+        .fold(f64::INFINITY, f64::min);
+    Some(DVec3::new(sx, sy, 0.0))
 }

@@ -21,7 +21,7 @@ use geometry::manifold::{
 };
 use model::alkis::{AlkisKind, SurfaceFeature};
 use model::building::Building;
-use model::tile::{BBox2, Tile};
+use model::tile::{shared_obj_origin, BBox2, Tile};
 use parsers::{
     alkis::{collect_alkis_files, stream_alkis_features},
     citygml::{collect_gml_files, stream_buildings},
@@ -47,6 +47,16 @@ fn main() -> Result<()> {
     }
     println!("Found {} DGM1 tile(s)", tiles.len());
 
+    // Shared OBJ anchor (SW-most corner across all tiles). Every per-tile
+    // OBJ in this run subtracts the same origin, so loading any combination
+    // of them into one scene preserves real-world relative positions.
+    let shared_origin =
+        shared_obj_origin(&tiles).expect("tiles non-empty (checked above)");
+    println!(
+        "Shared OBJ origin (UTM32N): x={:.3} y={:.3}",
+        shared_origin.x, shared_origin.y
+    );
+
     // Pre-create one sub-folder per tile.
     for tile in &tiles {
         let dir = cli.output.join(&tile.name);
@@ -57,27 +67,31 @@ fn main() -> Result<()> {
     // ------------------------------------------------------------------
     // Phase 1: terrain. Each tile is its own watertight solid.
     // ------------------------------------------------------------------
-    write_per_tile_terrain(&tiles, &cli.output)?;
+    write_per_tile_terrain(&tiles, &cli.output, shared_origin)?;
 
     // ------------------------------------------------------------------
     // Phase 2: buildings. Stream GMLs, clip each building to overlapping
     // tiles, write per-tile pieces.
     // ------------------------------------------------------------------
-    write_per_tile_buildings(&tiles, &cli)?;
+    write_per_tile_buildings(&tiles, &cli, shared_origin)?;
 
     // ------------------------------------------------------------------
     // Phase 3: ALKIS surface features (optional). Stream ALKIS, extrude
     // over terrain, clip to tile bbox, write per-tile road.obj / rail.obj.
     // ------------------------------------------------------------------
     if cli.alkis.is_some() {
-        write_per_tile_alkis(&tiles, &cli)?;
+        write_per_tile_alkis(&tiles, &cli, shared_origin)?;
     }
 
     println!("Done.");
     Ok(())
 }
 
-fn write_per_tile_terrain(tiles: &[Tile], output: &std::path::Path) -> Result<()> {
+fn write_per_tile_terrain(
+    tiles: &[Tile],
+    output: &std::path::Path,
+    shared_origin: DVec3,
+) -> Result<()> {
     let pb = progress_bar(tiles.len() as u64, "terrain tiles");
     for tile in tiles {
         pb.set_message(tile.name.clone());
@@ -102,12 +116,16 @@ fn write_per_tile_terrain(tiles: &[Tile], output: &std::path::Path) -> Result<()
         writer.write_comment("city-obj-creator — terrain")?;
         writer.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
         writer.write_comment(&format!(
-            "tile_origin_utm: x={:.3} y={:.3}",
+            "obj_origin_utm: x={:.3} y={:.3}  # subtracted from every vertex; identical across all tiles in this run",
+            shared_origin.x, shared_origin.y
+        ))?;
+        writer.write_comment(&format!(
+            "tile_nw_corner_utm: x={:.3} y={:.3}  # this tile's NW pixel center (informational)",
             tile.origin_x, tile.origin_y
         ))?;
         writer.write_newline()?;
         writer.write_object("Terrain")?;
-        let base = writer.write_vertices(&verts, tile.obj_origin())?;
+        let base = writer.write_vertices(&verts, shared_origin)?;
         writer.write_faces(&faces, base)?;
         writer.flush()?;
 
@@ -118,7 +136,7 @@ fn write_per_tile_terrain(tiles: &[Tile], output: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli) -> Result<()> {
+fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Result<()> {
     let gml_files = collect_gml_files(&cli.citygml)?;
     if gml_files.is_empty() {
         eprintln!("WARN: no .gml/.xml files found in {}", cli.citygml.display());
@@ -134,7 +152,11 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli) -> Result<()> {
         w.write_comment("city-obj-creator — buildings")?;
         w.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
         w.write_comment(&format!(
-            "tile_origin_utm: x={:.3} y={:.3}",
+            "obj_origin_utm: x={:.3} y={:.3}  # subtracted from every vertex; identical across all tiles in this run",
+            shared_origin.x, shared_origin.y
+        ))?;
+        w.write_comment(&format!(
+            "tile_nw_corner_utm: x={:.3} y={:.3}  # this tile's NW pixel center (informational)",
             tile.origin_x, tile.origin_y
         ))?;
         w.write_newline()?;
@@ -191,7 +213,7 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli) -> Result<()> {
                     .expect("writer must exist for known tile");
                 let name = sanitize_id(&building.id);
                 writer.write_object(&format!("Building_{name}"))?;
-                let base = writer.write_vertices(&piece_v, tile.obj_origin())?;
+                let base = writer.write_vertices(&piece_v, shared_origin)?;
                 writer.write_faces(&piece_t, base)?;
                 writer.write_newline()?;
                 *tile_building_counts.entry(tile.name.clone()).or_default() += 1;
@@ -249,7 +271,7 @@ const ALKIS_KINDS: &[AlkisKind] = &[
     AlkisKind::StehendesGewaesser,
 ];
 
-fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
+fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Result<()> {
     let alkis_dir = match cli.alkis.as_ref() {
         Some(d) => d,
         None => return Ok(()),
@@ -353,7 +375,11 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
                     w.write_comment(&format!("city-obj-creator — {label}"))?;
                     w.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
                     w.write_comment(&format!(
-                        "tile_origin_utm: x={:.3} y={:.3}",
+                        "obj_origin_utm: x={:.3} y={:.3}  # subtracted from every vertex; identical across all tiles in this run",
+                        shared_origin.x, shared_origin.y
+                    ))?;
+                    w.write_comment(&format!(
+                        "tile_nw_corner_utm: x={:.3} y={:.3}  # this tile's NW pixel center (informational)",
                         tile.origin_x, tile.origin_y
                     ))?;
                     w.write_newline()?;
@@ -363,7 +389,7 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli) -> Result<()> {
 
             let name = sanitize_id(&feat.id);
             writer.write_object(&format!("{prefix}_{name}"))?;
-            let base = writer.write_vertices(&piece_v, tile.obj_origin())?;
+            let base = writer.write_vertices(&piece_v, shared_origin)?;
             writer.write_faces(&piece_t, base)?;
             writer.write_newline()?;
             *total_pieces.entry(feat.kind).or_default() += 1;
