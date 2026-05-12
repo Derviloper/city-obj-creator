@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&cli.output)?;
 
     // ------------------------------------------------------------------
-    // Discover tiles: every output sub-folder corresponds to one .tif.
+    // Discover tiles: every output filename is prefixed with one tile name.
     // ------------------------------------------------------------------
     let tiles = list_tiles(&cli.dgm1)?;
     if tiles.is_empty() {
@@ -56,13 +56,6 @@ fn main() -> Result<()> {
         "Shared OBJ origin (UTM32N): x={:.3} y={:.3}",
         shared_origin.x, shared_origin.y
     );
-
-    // Pre-create one sub-folder per tile.
-    for tile in &tiles {
-        let dir = cli.output.join(&tile.name);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating output sub-folder {}", dir.display()))?;
-    }
 
     // ------------------------------------------------------------------
     // Phase 1: terrain. Each tile is its own watertight solid.
@@ -110,7 +103,7 @@ fn write_per_tile_terrain(
             continue;
         }
 
-        let path = output.join(&tile.name).join("terrain.obj");
+        let path = output.join(format!("{}_terrain.obj", tile.name));
         let mut writer = ObjWriter::open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         writer.write_comment("city-obj-creator — terrain")?;
@@ -146,7 +139,7 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> 
     // Open one writer per tile up front; close them all at the end.
     let mut writers: HashMap<String, ObjWriter> = HashMap::with_capacity(tiles.len());
     for tile in tiles {
-        let path = cli.output.join(&tile.name).join("buildings.obj");
+        let path = cli.output.join(format!("{}_buildings.obj", tile.name));
         let mut w = ObjWriter::open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         w.write_comment("city-obj-creator — buildings")?;
@@ -243,7 +236,7 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> 
 
     let total_pieces: u64 = tile_building_counts.values().sum();
     println!(
-        "Wrote {} building piece(s) across {} tile folder(s)",
+        "Wrote {} building piece(s) across {} tile(s)",
         total_pieces,
         tile_building_counts.len()
     );
@@ -369,7 +362,7 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
             let writer = match writers.entry(filename) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let path = cli.output.join(&tile.name).join(filename);
+                    let path = cli.output.join(format!("{}_{}", tile.name, filename));
                     let mut w = ObjWriter::open(&path)
                         .with_context(|| format!("opening {}", path.display()))?;
                     w.write_comment(&format!("city-obj-creator — {label}"))?;
