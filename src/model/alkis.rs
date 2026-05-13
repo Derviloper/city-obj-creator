@@ -6,6 +6,7 @@ pub enum AlkisKind {
     Strassenverkehr,
     Bahnverkehr,
     Weg,
+    Platz,
     Fliessgewaesser,
     StehendesGewaesser,
 }
