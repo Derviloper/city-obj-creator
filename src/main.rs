@@ -266,6 +266,11 @@ const ALKIS_KINDS: &[AlkisKind] = &[
     AlkisKind::StehendesGewaesser,
 ];
 
+/// ALKIS `<funktion>` codes whose features are dropped before they reach the
+/// per-tile fan-out. 2312 / 2322 designate sub-types that pollute the road
+/// and rail meshes with surfaces we don't want in the OBJ output.
+const EXCLUDED_ALKIS_FUNKTIONEN: &[u32] = &[2312, 2322];
+
 fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Result<()> {
     let alkis_dir = match cli.alkis.as_ref() {
         Some(d) => d,
@@ -283,6 +288,7 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
     let mut per_tile: HashMap<String, Vec<SurfaceFeature>> = HashMap::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dupes_skipped: u64 = 0;
+    let mut excluded_by_funktion: u64 = 0;
     let pb = progress_bar(alkis_files.len() as u64, "ALKIS files");
     for path in &alkis_files {
         let file_name = path
@@ -298,6 +304,12 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
             // occurrences so each ID enters the tile fan-out exactly once.
             if !feat.id.is_empty() && !seen_ids.insert(feat.id.clone()) {
                 dupes_skipped += 1;
+                return Ok(());
+            }
+            if let Some(f) = feat.funktion
+                && EXCLUDED_ALKIS_FUNKTIONEN.contains(&f)
+            {
+                excluded_by_funktion += 1;
                 return Ok(());
             }
             let bb = match ring_xy_bbox(&feat.exterior) {
@@ -322,6 +334,11 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
     pb.finish_with_message("ALKIS streamed");
     if dupes_skipped > 0 {
         println!("Deduplicated {dupes_skipped} ALKIS feature(s) seen in multiple files");
+    }
+    if excluded_by_funktion > 0 {
+        println!(
+            "Excluded {excluded_by_funktion} ALKIS feature(s) by funktion ({EXCLUDED_ALKIS_FUNKTIONEN:?})"
+        );
     }
 
     // Stage 2: per tile, load terrain once, build/clip/write each feature

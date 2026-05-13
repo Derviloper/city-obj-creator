@@ -109,6 +109,7 @@ fn drop_closing_duplicate(ring: &mut Vec<DVec2>) {
 enum State {
     Root,
     InFeature,
+    InFunktion,
     InPatch,
     InExterior,
     InInterior,
@@ -132,6 +133,8 @@ struct ParserState {
 
     feature_id: String,
     feature_kind: Option<AlkisKind>,
+    feature_funktion: Option<u32>,
+    funktion_buf: String,
     ring_role: Option<RingRole>,
 
     /// Vertices accumulating for the current `gml:posList`.
@@ -151,6 +154,8 @@ impl ParserState {
             feature_depth: 0,
             feature_id: String::new(),
             feature_kind: None,
+            feature_funktion: None,
+            funktion_buf: String::new(),
             ring_role: None,
             current_segment: Vec::new(),
             current_segments: Vec::new(),
@@ -221,6 +226,7 @@ pub fn stream_alkis_features(
                     ps.feature_depth = ps.depth;
                     ps.feature_id = id;
                     ps.feature_kind = Some(kind);
+                    ps.feature_funktion = None;
                     ps.exterior = None;
                     ps.interiors.clear();
                     continue;
@@ -232,6 +238,12 @@ pub fn stream_alkis_features(
                         // jump straight in on PolygonPatch.
                         if is_gml_ns(ns_bytes) && local_bytes == b"PolygonPatch" {
                             ps.state = State::InPatch;
+                        } else if is_adv_ns(ns_bytes)
+                            && local_bytes == b"funktion"
+                            && ps.depth == ps.feature_depth + 1
+                        {
+                            ps.state = State::InFunktion;
+                            ps.funktion_buf.clear();
                         }
                     }
                     State::InPatch => {
@@ -285,6 +297,9 @@ pub fn stream_alkis_features(
                     let text = e.unescape().unwrap_or_default();
                     let new_pts = parse_pos_list_2d(&text);
                     ps.current_segment.extend(new_pts);
+                } else if matches!(ps.state, State::InFunktion) {
+                    let text = e.unescape().unwrap_or_default();
+                    ps.funktion_buf.push_str(&text);
                 }
             }
 
@@ -297,6 +312,13 @@ pub fn stream_alkis_features(
                 };
 
                 match ps.state {
+                    State::InFunktion => {
+                        if is_adv_ns(ns_bytes) && local_bytes == b"funktion" {
+                            ps.feature_funktion = ps.funktion_buf.trim().parse::<u32>().ok();
+                            ps.funktion_buf.clear();
+                            ps.state = State::InFeature;
+                        }
+                    }
                     State::InPosListSeg => {
                         if is_gml_ns(ns_bytes) && local_bytes == b"posList" {
                             ps.state = State::InCurveSeg;
@@ -360,15 +382,18 @@ pub fn stream_alkis_features(
                             {
                                 let interiors = std::mem::take(&mut ps.interiors);
                                 let id = std::mem::take(&mut ps.feature_id);
+                                let funktion = ps.feature_funktion.take();
                                 visitor(SurfaceFeature {
                                     id,
                                     kind,
+                                    funktion,
                                     exterior,
                                     interiors,
                                 })?;
                             } else {
                                 ps.interiors.clear();
                                 ps.feature_id.clear();
+                                ps.feature_funktion = None;
                             }
                             ps.feature_kind = None;
                             ps.state = State::Root;

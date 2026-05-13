@@ -19,6 +19,9 @@ pub enum AlkisKind {
 pub struct SurfaceFeature {
     pub id: String,
     pub kind: AlkisKind,
+    /// ALKIS classification sub-code (e.g. 2312, 5210). Direct child element
+    /// `<funktion>` of the AX_* feature. `None` when absent or unparseable.
+    pub funktion: Option<u32>,
     pub exterior: Vec<DVec2>,
     /// Interior rings (holes). Honored by the road and water meshers: each
     /// interior is clipped to the tile, added as a CDT constraint loop, and
