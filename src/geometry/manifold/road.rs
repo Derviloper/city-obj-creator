@@ -70,6 +70,64 @@ pub fn build_manifold_road(
         }
     }
 
+    // Prepare interior rings (holes). Each interior runs through the same
+    // clip → densify → terrain-sample pipeline as the exterior. Failures here
+    // drop only the offending interior so the feature still meshes (a missing
+    // hole is no worse than today's behaviour where all holes are ignored).
+    let mut interiors_prepared: Vec<(Vec<DVec2>, Vec<f64>)> =
+        Vec::with_capacity(feature.interiors.len());
+    let mut straddle_warned = false;
+    for interior in &feature.interiors {
+        if interior.len() < 3 {
+            continue;
+        }
+        let mut iring: Vec<DVec2> = interior.clone();
+        // Interiors are nominally CW; enforce that so winding is consistent
+        // (spade itself is orientation-agnostic, but our local helpers are not).
+        if signed_area_2d(&iring) > 0.0 {
+            iring.reverse();
+        }
+        let iclipped = clip_polygon_to_aabb_xy_2d(&iring, tile_bbox);
+        if iclipped.len() < 3 {
+            continue;
+        }
+        // Straddle guard: a tile cut that opens the hole means it no longer
+        // bounds a closed region inside the (also clipped) exterior. Drop it.
+        if iclipped.iter().any(|v| !point_in_polygon(*v, &densified)) {
+            if !straddle_warned {
+                eprintln!(
+                    "WARN: ALKIS feature '{}' has an interior ring straddling tile bbox — hole dropped on this tile",
+                    feature.id
+                );
+                straddle_warned = true;
+            }
+            continue;
+        }
+        let idensified = densify_ring(&iclipped, ROAD_RING_DENSIFY_M);
+        if idensified.len() < 3 {
+            continue;
+        }
+        let mut izs: Vec<f64> = Vec::with_capacity(idensified.len());
+        let mut nan_hit = false;
+        for p in &idensified {
+            match terrain.sample_z(p.x, p.y) {
+                Some(z) => izs.push(z),
+                None => {
+                    eprintln!(
+                        "WARN: road feature '{}' — interior ring vertex in NaN terrain; hole dropped",
+                        feature.id
+                    );
+                    nan_hit = true;
+                    break;
+                }
+            }
+        }
+        if nan_hit {
+            continue;
+        }
+        interiors_prepared.push((idensified, izs));
+    }
+
     // Interior Steiner points on a regular grid, point-in-polygon filtered.
     let bb = ring_bbox(&densified);
     let res = ROAD_GRID_RES_M;
@@ -83,6 +141,9 @@ pub fn build_manifold_road(
         while y <= bb.ymax {
             let p = DVec2::new(x, y);
             if point_in_polygon(p, &densified)
+                && !interiors_prepared
+                    .iter()
+                    .any(|(ring, _)| point_in_polygon(p, ring))
                 && let Some(z) = terrain.sample_z(p.x, p.y)
             {
                 steiner.push(p);
@@ -120,6 +181,38 @@ pub fn build_manifold_road(
         ring_handles.push(h);
     }
 
+    // Insert each interior ring's vertices. A failed insert drops the rest
+    // of that ring rather than killing the feature.
+    let mut interior_handles: Vec<Vec<FixedVertexHandle>> =
+        Vec::with_capacity(interiors_prepared.len());
+    for (iring, izs) in &interiors_prepared {
+        let mut ih: Vec<FixedVertexHandle> = Vec::with_capacity(iring.len());
+        let mut broken = false;
+        for (p, z) in iring.iter().zip(izs.iter()) {
+            match cdt.insert(Point2::new(p.x, p.y)) {
+                Ok(h) => {
+                    handle_to_idx.entry(h).or_insert_with(|| {
+                        all_pts.push(*p);
+                        all_zs.push(*z);
+                        all_pts.len() - 1
+                    });
+                    ih.push(h);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: road feature '{}' — CDT interior insert failed: {e:?}; hole dropped",
+                        feature.id
+                    );
+                    broken = true;
+                    break;
+                }
+            }
+        }
+        if !broken && ih.len() >= 3 {
+            interior_handles.push(ih);
+        }
+    }
+
     let mut steiner_handles: Vec<FixedVertexHandle> = Vec::with_capacity(steiner.len());
     for (p, z) in steiner.iter().zip(steiner_zs.iter()) {
         let h = match cdt.insert(Point2::new(p.x, p.y)) {
@@ -141,6 +234,19 @@ pub fn build_manifold_road(
         let j = (i + 1) % n_ring;
         if ring_handles[i] != ring_handles[j] {
             let _ = cdt.add_constraint(ring_handles[i], ring_handles[j]);
+        }
+    }
+
+    // Constrain each interior ring's edges. Same panic-on-crossing semantics
+    // as the exterior loop above — ALKIS interiors should not cross their
+    // exterior in well-formed data.
+    for ih in &interior_handles {
+        let m = ih.len();
+        for i in 0..m {
+            let j = (i + 1) % m;
+            if ih[i] != ih[j] {
+                let _ = cdt.add_constraint(ih[i], ih[j]);
+            }
         }
     }
 
@@ -172,7 +278,11 @@ pub fn build_manifold_road(
                 (p0.x + p1.x + p2.x) / 3.0,
                 (p0.y + p1.y + p2.y) / 3.0,
             );
-            if point_in_polygon(centroid, &densified) {
+            if point_in_polygon(centroid, &densified)
+                && !interiors_prepared
+                    .iter()
+                    .any(|(ring, _)| point_in_polygon(centroid, ring))
+            {
                 seeds.push(face.fix());
             }
         }

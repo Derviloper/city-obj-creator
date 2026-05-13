@@ -81,6 +81,57 @@ pub fn build_manifold_water(
         }
     }
 
+    // Prepare interior rings (holes) — see build_manifold_road for the rationale.
+    let mut interiors_prepared: Vec<(Vec<DVec2>, Vec<f64>)> =
+        Vec::with_capacity(feature.interiors.len());
+    let mut straddle_warned = false;
+    for interior in &feature.interiors {
+        if interior.len() < 3 {
+            continue;
+        }
+        let mut iring: Vec<DVec2> = interior.clone();
+        if signed_area_2d(&iring) > 0.0 {
+            iring.reverse();
+        }
+        let iclipped = clip_polygon_to_aabb_xy_2d(&iring, tile_bbox);
+        if iclipped.len() < 3 {
+            continue;
+        }
+        if iclipped.iter().any(|v| !point_in_polygon(*v, &densified)) {
+            if !straddle_warned {
+                eprintln!(
+                    "WARN: ALKIS feature '{}' has an interior ring straddling tile bbox — hole dropped on this tile",
+                    feature.id
+                );
+                straddle_warned = true;
+            }
+            continue;
+        }
+        let idensified = densify_ring(&iclipped, WATER_RING_DENSIFY_M);
+        if idensified.len() < 3 {
+            continue;
+        }
+        let mut izs: Vec<f64> = Vec::with_capacity(idensified.len());
+        let mut nan_hit = false;
+        for p in &idensified {
+            match terrain.sample_z(p.x, p.y) {
+                Some(z) => izs.push(z),
+                None => {
+                    eprintln!(
+                        "WARN: water feature '{}' — interior ring vertex in NaN terrain; hole dropped",
+                        feature.id
+                    );
+                    nan_hit = true;
+                    break;
+                }
+            }
+        }
+        if nan_hit {
+            continue;
+        }
+        interiors_prepared.push((idensified, izs));
+    }
+
     let bb = ring_bbox(&densified);
     let res = WATER_GRID_RES_M;
     let x0 = (bb.xmin / res).ceil() * res;
@@ -93,6 +144,9 @@ pub fn build_manifold_water(
         while y <= bb.ymax {
             let p = DVec2::new(x, y);
             if point_in_polygon(p, &densified)
+                && !interiors_prepared
+                    .iter()
+                    .any(|(ring, _)| point_in_polygon(p, ring))
                 && let Some(z) = terrain.sample_z(p.x, p.y)
             {
                 steiner.push(p);
@@ -129,6 +183,36 @@ pub fn build_manifold_water(
         ring_handles.push(h);
     }
 
+    let mut interior_handles: Vec<Vec<FixedVertexHandle>> =
+        Vec::with_capacity(interiors_prepared.len());
+    for (iring, izs) in &interiors_prepared {
+        let mut ih: Vec<FixedVertexHandle> = Vec::with_capacity(iring.len());
+        let mut broken = false;
+        for (p, z) in iring.iter().zip(izs.iter()) {
+            match cdt.insert(Point2::new(p.x, p.y)) {
+                Ok(h) => {
+                    handle_to_idx.entry(h).or_insert_with(|| {
+                        all_pts.push(*p);
+                        all_zs.push(*z);
+                        all_pts.len() - 1
+                    });
+                    ih.push(h);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: water feature '{}' — CDT interior insert failed: {e:?}; hole dropped",
+                        feature.id
+                    );
+                    broken = true;
+                    break;
+                }
+            }
+        }
+        if !broken && ih.len() >= 3 {
+            interior_handles.push(ih);
+        }
+    }
+
     let mut steiner_handles: Vec<FixedVertexHandle> = Vec::with_capacity(steiner.len());
     for (p, z) in steiner.iter().zip(steiner_zs.iter()) {
         let h = match cdt.insert(Point2::new(p.x, p.y)) {
@@ -147,6 +231,16 @@ pub fn build_manifold_water(
         let j = (i + 1) % n_ring;
         if ring_handles[i] != ring_handles[j] {
             let _ = cdt.add_constraint(ring_handles[i], ring_handles[j]);
+        }
+    }
+
+    for ih in &interior_handles {
+        let m = ih.len();
+        for i in 0..m {
+            let j = (i + 1) % m;
+            if ih[i] != ih[j] {
+                let _ = cdt.add_constraint(ih[i], ih[j]);
+            }
         }
     }
 
@@ -170,7 +264,11 @@ pub fn build_manifold_water(
                 (p0.x + p1.x + p2.x) / 3.0,
                 (p0.y + p1.y + p2.y) / 3.0,
             );
-            if point_in_polygon(centroid, &densified) {
+            if point_in_polygon(centroid, &densified)
+                && !interiors_prepared
+                    .iter()
+                    .any(|(ring, _)| point_in_polygon(centroid, ring))
+            {
                 seeds.push(face.fix());
             }
         }

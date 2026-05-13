@@ -16,12 +16,12 @@ pub enum AlkisKind {
 /// ring is normalized to CCW (when viewed from +z) and does not repeat its
 /// first vertex at the end.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `kind` and `interiors` are populated for future ALKIS types and hole support.
 pub struct SurfaceFeature {
     pub id: String,
     pub kind: AlkisKind,
     pub exterior: Vec<DVec2>,
-    /// Interior rings (holes). Currently parsed but ignored by the mesher;
-    /// kept on the struct so adding hole support later is non-breaking.
+    /// Interior rings (holes). Honored by the road and water meshers: each
+    /// interior is clipped to the tile, added as a CDT constraint loop, and
+    /// excluded from the top/bottom caps with inward-facing side walls.
     pub interiors: Vec<Vec<DVec2>>,
 }
