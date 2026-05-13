@@ -281,6 +281,8 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
     // Storing 2D rings is cheap; one full terrain grid in memory at a time
     // (Stage 2) is the real memory budget.
     let mut per_tile: HashMap<String, Vec<SurfaceFeature>> = HashMap::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dupes_skipped: u64 = 0;
     let pb = progress_bar(alkis_files.len() as u64, "ALKIS files");
     for path in &alkis_files {
         let file_name = path
@@ -291,6 +293,13 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
         pb.set_message(file_name);
 
         let result = stream_alkis_features(path, |feat: SurfaceFeature| -> Result<()> {
+            // ALKIS features that cross municipality borders are exported into
+            // every covering AX_Bestandsdatenauszug verbatim. Drop subsequent
+            // occurrences so each ID enters the tile fan-out exactly once.
+            if !feat.id.is_empty() && !seen_ids.insert(feat.id.clone()) {
+                dupes_skipped += 1;
+                return Ok(());
+            }
             let bb = match ring_xy_bbox(&feat.exterior) {
                 Some(b) => b,
                 None => return Ok(()),
@@ -311,6 +320,9 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
         pb.inc(1);
     }
     pb.finish_with_message("ALKIS streamed");
+    if dupes_skipped > 0 {
+        println!("Deduplicated {dupes_skipped} ALKIS feature(s) seen in multiple files");
+    }
 
     // Stage 2: per tile, load terrain once, build/clip/write each feature
     // routed to the per-kind writer.
