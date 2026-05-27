@@ -117,7 +117,7 @@ fn write_per_tile_terrain(
             tile.origin_x, tile.origin_y
         ))?;
         writer.write_newline()?;
-        writer.write_object("Terrain")?;
+        writer.write_object(&format!("terrains/{}", tile.name))?;
         let base = writer.write_vertices(&verts, shared_origin)?;
         writer.write_faces(&faces, base)?;
         writer.flush()?;
@@ -205,7 +205,7 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> 
                     .get_mut(&tile.name)
                     .expect("writer must exist for known tile");
                 let name = sanitize_id(&building.id);
-                writer.write_object(&format!("Building_{name}"))?;
+                writer.write_object(&format!("buildings/{name}"))?;
                 let base = writer.write_vertices(&piece_v, shared_origin)?;
                 writer.write_faces(&piece_t, base)?;
                 writer.write_newline()?;
@@ -243,17 +243,17 @@ fn write_per_tile_buildings(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> 
     Ok(())
 }
 
-/// Per-kind output configuration: filename, header label, and OBJ object-name
-/// prefix. Adding a new ALKIS surface kind is one entry here plus a parser
-/// match arm and an `AlkisKind` variant.
-fn alkis_kind_output(kind: AlkisKind) -> (&'static str, &'static str, &'static str) {
+/// Per-kind output configuration. The first element is the stem used both as
+/// the output file name (`<tile>_<group>.obj`) and as the OBJ object-group
+/// folder. The second is an optional leaf-name prefix; empty when not needed.
+fn alkis_kind_output(kind: AlkisKind) -> (&'static str, &'static str) {
     match kind {
-        AlkisKind::Strassenverkehr => ("road.obj", "road", "Road"),
-        AlkisKind::Bahnverkehr => ("rail.obj", "rail", "Rail"),
-        AlkisKind::Weg => ("path.obj", "path", "Path"),
-        AlkisKind::Platz => ("road.obj", "road", "Plaza"),
-        AlkisKind::Fliessgewaesser => ("water.obj", "water", "WaterFlow"),
-        AlkisKind::StehendesGewaesser => ("water.obj", "water", "WaterStill"),
+        AlkisKind::Strassenverkehr => ("roads", ""),
+        AlkisKind::Bahnverkehr => ("rails", ""),
+        AlkisKind::Weg => ("paths", ""),
+        AlkisKind::Platz => ("roads", "Plaza_"),
+        AlkisKind::Fliessgewaesser => ("water", "Flow_"),
+        AlkisKind::StehendesGewaesser => ("water", "Still_"),
     }
 }
 
@@ -388,16 +388,19 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
                 continue;
             }
 
-            let (filename, label, prefix) = alkis_kind_output(feat.kind);
-            check_manifold(&format!("{prefix}_{}@{}", feat.id, tile.name), &piece_t);
+            let (group, id_prefix) = alkis_kind_output(feat.kind);
+            check_manifold(
+                &format!("{group}/{id_prefix}{}@{}", feat.id, tile.name),
+                &piece_t,
+            );
 
-            let writer = match writers.entry(filename) {
+            let writer = match writers.entry(group) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let path = cli.output.join(format!("{}_{}", tile.name, filename));
+                    let path = cli.output.join(format!("{}_{}.obj", tile.name, group));
                     let mut w = ObjWriter::open(&path)
                         .with_context(|| format!("opening {}", path.display()))?;
-                    w.write_comment(&format!("city-obj-creator — {label}"))?;
+                    w.write_comment(&format!("city-obj-creator — {group}"))?;
                     w.write_comment("CRS: ETRS89/UTM32N EPSG:25832")?;
                     w.write_comment(&format!(
                         "obj_origin_utm: x={:.3} y={:.3}  # subtracted from every vertex; identical across all tiles in this run",
@@ -413,7 +416,7 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
             };
 
             let name = sanitize_id(&feat.id);
-            writer.write_object(&format!("{prefix}_{name}"))?;
+            writer.write_object(&format!("{group}/{id_prefix}{name}"))?;
             let base = writer.write_vertices(&piece_v, shared_origin)?;
             writer.write_faces(&piece_t, base)?;
             writer.write_newline()?;
@@ -429,8 +432,8 @@ fn write_per_tile_alkis(tiles: &[Tile], cli: &Cli, shared_origin: DVec3) -> Resu
 
     for kind in ALKIS_KINDS {
         let count = total_pieces.get(kind).copied().unwrap_or(0);
-        let (_, label, _) = alkis_kind_output(*kind);
-        println!("Wrote {count} {label} piece(s)");
+        let (group, id_prefix) = alkis_kind_output(*kind);
+        println!("Wrote {count} {group}/{id_prefix}* piece(s)");
     }
     Ok(())
 }

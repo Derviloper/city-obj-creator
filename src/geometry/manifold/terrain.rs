@@ -3,7 +3,7 @@ use glam::DVec3;
 use crate::model::terrain::GlobalTerrain;
 
 /// Fixed elevation of the underside of the terrain mesh.
-const Z_BASE: f64 = 250.0;
+const Z_BASE: f64 = 225.0;
 
 /// Build a single watertight terrain mesh from a combined elevation grid.
 ///
